@@ -1,0 +1,294 @@
+// lib.rs — NestDesk v0：桌面层 surface 引擎 + 收纳归档 + journal 复原 + 小组件
+mod fs_core;
+mod layer;
+
+use fs_core::{Config, IngestResult, Snapshot, UndoReport};
+use serde::Serialize;
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use tauri::{Manager, PhysicalPosition, PhysicalSize, Position, Size};
+
+pub const SURFACES: [&str; 4] = ["shelf", "clock", "sysmon", "note"];
+
+// ---------- 应用级路径 ----------
+fn appdata() -> PathBuf {
+    PathBuf::from(std::env::var("APPDATA").unwrap_or_else(|_| ".".into()))
+}
+fn data_dir() -> PathBuf {
+    let p = appdata().join("NestDesk");
+    let _ = fs::create_dir_all(&p);
+    p
+}
+fn user_home() -> PathBuf {
+    PathBuf::from(std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into()))
+}
+fn desktop_dir() -> PathBuf {
+    // OneDrive 重定向时 USERPROFILE\Desktop 可能是假路径 → 问系统要真实桌面
+    let found = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", "[Environment]::GetFolderPath('Desktop')"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !s.is_empty() && Path::new(&s).exists() { Some(PathBuf::from(s)) } else { None }
+        });
+    found.unwrap_or_else(|| user_home().join("Desktop"))
+}
+fn real_cfg() -> Config {
+    Config {
+        desktop: desktop_dir(),
+        inbox_root: user_home().join("Nest").join("收件箱"),
+        journal: data_dir().join("journal.jsonl"),
+    }
+}
+
+// ---------- 收纳/复原 commands ----------
+#[tauri::command]
+fn shelf_snapshot() -> Snapshot {
+    fs_core::snapshot(&real_cfg())
+}
+#[tauri::command]
+fn shelf_ingest(paths: Vec<String>) -> IngestResult {
+    fs_core::ingest(&real_cfg(), paths)
+}
+#[tauri::command]
+fn shelf_collect_desktop() -> IngestResult {
+    fs_core::collect_desktop(&real_cfg())
+}
+#[tauri::command]
+fn shelf_undo_last() -> UndoReport {
+    fs_core::undo_last(&real_cfg())
+}
+#[tauri::command]
+fn shelf_undo_all() -> UndoReport {
+    fs_core::undo_all(&real_cfg())
+}
+
+// ---------- 系统监视 command ----------
+#[derive(Serialize)]
+struct Battery { percent: u8, ac: bool, charging: bool }
+#[derive(Serialize)]
+struct SysInfo { cpu: f64, mem_total: u64, mem_used: u64, battery: Option<Battery> }
+
+#[tauri::command]
+fn get_sysinfo() -> SysInfo {
+    let (mem_total, mem_avail) = layer::memory().unwrap_or((0, 0));
+    SysInfo {
+        cpu: layer::cpu_usage(),
+        mem_total,
+        mem_used: mem_total.saturating_sub(mem_avail),
+        battery: layer::battery().map(|(p, ac, ch)| Battery { percent: p, ac, charging: ch }),
+    }
+}
+
+// ---------- 便利贴 ----------
+#[tauri::command]
+fn note_get() -> String {
+    fs::read_to_string(data_dir().join("note.txt")).unwrap_or_default()
+}
+#[tauri::command]
+fn note_set(text: String) {
+    let _ = fs::write(data_dir().join("note.txt"), text);
+}
+
+// ---------- 皮肤 ----------
+#[tauri::command]
+fn theme_get() -> String {
+    fs::read_to_string(data_dir().join("config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("theme").and_then(|t| t.as_str()).map(String::from))
+        .unwrap_or_else(|| "night".into())
+}
+#[tauri::command]
+fn theme_set(theme: String) {
+    let _ = fs::write(data_dir().join("config.json"), format!("{{\"theme\":\"{theme}\"}}"));
+}
+
+// ---------- 布局持久化 + 桌面层钉扎 ----------
+#[derive(Serialize, serde::Deserialize, Clone, Copy, PartialEq)]
+struct Geom { x: i32, y: i32, w: u32, h: u32 }
+
+fn layout_path() -> PathBuf { data_dir().join("layout.json") }
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct LayoutFile(HashMap<String, Geom>);
+
+fn load_layout() -> HashMap<String, Geom> {
+    fs::read_to_string(layout_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<LayoutFile>(&s).ok())
+        .map(|l| l.0)
+        .unwrap_or_default()
+}
+
+fn save_layout(map: &HashMap<String, Geom>) {
+    let tmp = layout_path().with_extension("json.tmp");
+    if let Ok(s) = serde_json::to_string(&LayoutFile(map.clone())) {
+        let _ = fs::write(&tmp, s);
+        let bak = layout_path().with_extension("json.bak");
+        let main = layout_path();
+        if main.exists() {
+            let _ = fs::rename(&main, bak);
+        }
+        let _ = fs::rename(&tmp, &main);
+    }
+}
+
+fn surfaces(app: &tauri::AppHandle) -> Vec<tauri::WebviewWindow> {
+    SURFACES.iter().filter_map(|l| app.get_webview_window(l)).collect()
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    let app = tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![
+            shelf_snapshot, shelf_ingest, shelf_collect_desktop, shelf_undo_last, shelf_undo_all,
+            get_sysinfo, note_get, note_set, theme_get, theme_set
+        ])
+        .build(tauri::generate_context!())
+        .expect("NestDesk 启动失败");
+
+    // 启动时恢复布局（layout.json 缺失/损坏则用 tauri.conf 默认位置）
+    for (label, g) in load_layout() {
+        if let Some(w) = app.get_webview_window(label.as_str()) {
+            let _ = w.set_position(Position::Physical(PhysicalPosition::new(g.x, g.y)));
+            let _ = w.set_size(Size::Physical(PhysicalSize::new(g.w, g.h)));
+        }
+    }
+
+    // 主循环线程：钉扎桌面层 + 位置采样（移动后 3 秒静止自动落盘 .bak 双份）
+    let handle = app.handle().clone();
+    std::thread::spawn(move || {
+        let mut last: HashMap<String, Geom> = HashMap::new();
+        let mut dirty_since: Option<std::time::Instant> = None;
+        loop {
+            std::thread::sleep(Duration::from_millis(2000));
+            let mut changed = false;
+            for w in surfaces(&handle) {
+                if let Ok(h) = w.hwnd() {
+                    unsafe { layer::pin_bottom(h.0 as *mut std::ffi::c_void) };
+                }
+                if let (Ok(pos), Ok(size)) = (w.outer_position(), w.inner_size()) {
+                    let g = Geom { x: pos.x, y: pos.y, w: size.width, h: size.height };
+                    if last.get(w.label()) != Some(&g) {
+                        last.insert(w.label().to_string(), g);
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                dirty_since = Some(std::time::Instant::now());
+            } else if let Some(t) = dirty_since {
+                if t.elapsed() > Duration::from_secs(3) {
+                    save_layout(&last);
+                    dirty_since = None;
+                }
+            }
+        }
+    });
+
+    app.run(|_app, _event| {});
+}
+
+// ---------- selftest：--selftest 全离线自测（A3/A4 自动化版，不碰真实桌面） ----------
+pub fn selftest() {
+    use std::collections::HashSet;
+    let root = std::env::temp_dir().join(format!("nestdesk-selftest-{}", fs_core::now_ms()));
+    let desktop = root.join("Desktop");
+    let inbox = root.join("Nest").join("收件箱");
+    let alt = root.join("alt");
+    let _ = fs::create_dir_all(&desktop);
+    let _ = fs::create_dir_all(&alt);
+    let cfg = Config { desktop: desktop.clone(), inbox_root: inbox.clone(), journal: root.join("journal.jsonl") };
+
+    let mut checks: Vec<serde_json::Value> = Vec::new();
+    let mut report = |name: &str, ok: bool, info: String| {
+        checks.push(serde_json::json!({"name": name, "ok": ok, "info": info}));
+    };
+
+    // 样本：多类型 + 中文名 + 大写扩展名 + 未知扩展 + 批间同名冲突
+    let mut originals: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut paths_b1: Vec<String> = Vec::new();
+    for i in 0..120 {
+        let name = match i % 6 {
+            0 => format!("报告 {i}.docx"),
+            1 => format!("photo_{i}.PNG"),
+            2 => format!("clip_{i}.mp4"),
+            3 => format!("data_{i}.unknownext"),
+            4 => format!("setup_{i}.msi"),
+            _ => format!("code_{i}.rs"),
+        };
+        let p = desktop.join(&name);
+        let content = format!("nestdesk-selftest-{name}").into_bytes();
+        fs::write(&p, &content).unwrap();
+        originals.insert(name, content);
+        paths_b1.push(p.to_string_lossy().to_string());
+    }
+    let mut paths_b2: Vec<String> = Vec::new();
+    for i in 0..80 {
+        let name = format!("dup_{}.txt", i % 40); // 每个名字出现两次 → 测 (2) 后缀
+        let p = alt.join(&name);
+        let content = format!("alt-{name}-{i}").into_bytes();
+        fs::write(&p, &content).unwrap();
+        paths_b2.push(p.to_string_lossy().to_string());
+    }
+
+    let r1 = fs_core::ingest(&cfg, paths_b1);
+    report("批1: 120 文件全部归档", r1.moved.len() == 120 && r1.failed.is_empty(), format!("{} ok / {} fail", r1.moved.len(), r1.failed.len()));
+    let r2 = fs_core::ingest(&cfg, paths_b2);
+    report("批2: 80 文件全部归档(含同名)", r2.moved.len() == 80, format!("{}", r2.moved.len()));
+
+    let ents = fs_core::read_entries(&cfg);
+    let in_group = |name: &str, want: &str| ents.iter().any(|e| e.new.contains(&format!("{want}\\{name}")) || e.new.contains(&format!("{want}/{name}")));
+    report("分类: docx→文档", in_group("报告 0.docx", "文档"), String::new());
+    report("分类: 大写.PNG→图片", in_group("photo_1.PNG", "图片"), String::new());
+    report("分类: unknownext→其他", in_group("data_3.unknownext", "其他"), String::new());
+    report("分类: msi→安装包", in_group("setup_4.msi", "安装包"), String::new());
+
+    let d3 = ents.iter().filter(|e| e.old.contains("data_3")).count();
+    let d3suffixed = ents.iter().any(|e| e.new.contains("data_3.unknownext (2)"));
+    report("冲突: 同名批2落点带 (2) 后缀", d3 == 2 && d3suffixed, format!("d3={d3} suffixed={d3suffixed}"));
+
+    // 删除一个已归档文件 → undo 计 missing 不崩
+    let victim = ents[0].new.clone();
+    let _ = fs::remove_file(&victim);
+
+    let rep = fs_core::undo_all(&cfg);
+    let mut found: HashSet<Vec<u8>> = HashSet::new();
+    let mut scan = |dir: &PathBuf| {
+        if let Ok(rd) = fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_file() {
+                    if let Ok(b) = fs::read(&p) { found.insert(b); }
+                }
+            }
+        }
+    };
+    scan(&desktop);
+    scan(&alt);
+    let miss: Vec<String> = originals.iter().filter(|(_, c)| !found.contains(*c)).map(|(n, _)| n.clone()).collect();
+    report("复原: 其余文件字节级归位", miss.len() <= 1, format!("miss={:?}", miss));
+    report("复原: 被删文件计入 missing", rep.missing.len() == 1, format!("{:?}", rep.missing));
+    report("复原后 journal 清空", fs_core::read_entries(&cfg).is_empty(), String::new());
+
+    let rep2 = fs_core::undo_all(&cfg);
+    report("幂等: 重复全部复原 no-op", rep2.restored == 0 && rep2.batches_left == 0, format!("{rep2:?}"));
+
+    // undo_last 粒度：只回滚末批
+    let p1 = desktop.join("batchA.txt");
+    let p2 = desktop.join("batchB.txt");
+    fs::write(&p1, b"A").unwrap();
+    fs::write(&p2, b"B").unwrap();
+    fs_core::ingest(&cfg, vec![p1.to_string_lossy().to_string()]);
+    fs_core::ingest(&cfg, vec![p2.to_string_lossy().to_string()]);
+    let rep3 = fs_core::undo_last(&cfg);
+    report("粒度: undo_last 仅回滚末批", rep3.restored == 1 && !p1.exists() && p2.exists() && fs_core::read_entries(&cfg).len() == 1, format!("{rep3:?}"));
+
+    let pass = checks.iter().all(|c| c["ok"].as_bool().unwrap_or(false));
+    println!("{}", serde_json::to_string_pretty(&serde_json::json!({"pass": pass, "checks": checks, "root": root})).unwrap());
+    std::process::exit(if pass { 0 } else { 1 });
+}

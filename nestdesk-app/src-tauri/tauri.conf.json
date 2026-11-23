@@ -1,0 +1,86 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "NestDesk",
+  "version": "0.1.0",
+  "identifier": "com.chen.nestdesk",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "shelf",
+        "title": "归巢 · 桌面收件箱",
+        "width": 460,
+        "height": 640,
+        "x": 920,
+        "y": 40,
+        "transparent": true,
+        "decorations": false,
+        "skipTaskbar": true,
+        "resizable": false,
+        "shadow": false,
+        "focus": true
+      },
+      {
+        "label": "clock",
+        "title": "归巢 · 时钟",
+        "width": 240,
+        "height": 150,
+        "x": 1420,
+        "y": 40,
+        "transparent": true,
+        "decorations": false,
+        "skipTaskbar": true,
+        "resizable": false,
+        "shadow": false,
+        "focus": false
+      },
+      {
+        "label": "sysmon",
+        "title": "归巢 · 系统监视",
+        "width": 240,
+        "height": 200,
+        "x": 1420,
+        "y": 210,
+        "transparent": true,
+        "decorations": false,
+        "skipTaskbar": true,
+        "resizable": false,
+        "shadow": false,
+        "focus": false
+      },
+      {
+        "label": "note",
+        "title": "归巢 · 便利贴",
+        "width": 240,
+        "height": 260,
+        "x": 1420,
+        "y": 430,
+        "transparent": true,
+        "decorations": false,
+        "skipTaskbar": true,
+        "resizable": false,
+        "shadow": false,
+        "focus": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

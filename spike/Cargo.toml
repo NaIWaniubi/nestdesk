@@ -1,0 +1,10 @@
+[package]
+name = "nestdesk-spike"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# 零依赖：全部用裸 extern "system" FFI，离线可编译
+
+[profile.release]
+opt-level = 1
