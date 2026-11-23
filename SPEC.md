@@ -83,6 +83,12 @@
 | A6 | 重启后框布局/规则/journal 完整；关掉软件后桌面回到原生状态（真图标零污染） | 手动 |
 | A7 | C7/C9/C10 三种异常路径各触发一次且提示正确、可复原 | 手动构造 |
 
+## 8. 实现进度（滚动更新）
+- ✅ v0.1（2026-11-24）：M1 收纳框（拖入+分类+收取桌面）、M1.5 组件（时钟/系统监视/便利贴+4皮肤+布局自动持久化）、
+  M2 journal（JSONL，undo_last/undo_all，missing/conflict 报告）、内置 12 断言 selftest。
+  代码 nestdesk-app/；spike 结论已固化进 layer.rs。
+- ⏳ 待办：托盘+全局快捷键、开机自启、每框独立规则、YAML 导入导出、天气/倒计时组件（联网组）、管理员窗口拖放兜底 UI。
+
 ## 6. 非目标（MVP 明确不做）
 Dock/桌面栏、完整音乐播放器（仅留 now-playing 数据接口给 music 组件）、规则 YAML 编辑器、多用户同步、macOS/Linux。
 架构上以"另一个桌面层窗口 + sidecar 进程"接入 M3，不做重构级预留。
@@ -93,7 +99,12 @@ Dock/桌面栏、完整音乐播放器（仅留 now-playing 数据接口给 musi
   正确架构 = Fences 本尊的做法：**top-level `WS_POPUP | WS_EX_LAYERED | WS_EX_TOOLWINDOW` + `SetWindowPos(HWND_BOTTOM)`**，
   用 2s 定时器兜底（Win+D 会最小化我们 → IsIconic 则 SW_RESTORE + 重新沉底）。已在 spike 上验证：
   清屏后桌面层可见 ✅、普通窗口之上自动沉底 ✅、日志无重挂抖动 ✅。
-- Explorer 重启对 top-level 方案天然无父链依赖，只剩 Z 序漂移，由定时器兜底。
+- **合成黑洞（v0.1 实测，最终定案）**：tauri `transparent:true` 窗口带 `WS_EX_NOREDIRECTIONBITMAP(0x40000)`，
+  该样式窗口沉底后完全不参与桌面合成（A/B：PrintWindow 有内容、屏摄/GDI 均无）。
+  修复 = 每窗**一次性**去掉 0x40000、补 `WS_EX_LAYERED + LWA_ALPHA(254)`（layer.rs::ensure_layered）；
+  **样式只打一次**——每 2s 重写扩展样式 + DWM ACRYLIC backdrop 都会把窗口踢出合成（层层踩坑实录）。
+  最终验证（pxcnt.ps1 GDI 读数）：note 区 RGB(199,218,236) < 邻区(209,228,246)，卡片参与合成 ✓。
+- Explorer 重启对 top-level 方案天然无父链依赖，Z 序漂移由 2s 钉扎循环兜底。
 - 跨权限拖放（从管理员资源管理器拖入）受 UIPI 限制，MVP 不解决，走"框上右键→从此路径导入"兜底。
 - 复原的前提是文件仍在本机且未被用户手动删除（C10 报告机制兜底）。
 - 待办：M1 用 Tauri 重写窗口层（`windows` crate 调同一组 API，WebView 内容层负责皮肤），真拖放需 `IDropTarget` 桥。

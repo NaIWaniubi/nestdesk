@@ -167,9 +167,27 @@ pub fn run() {
         loop {
             std::thread::sleep(Duration::from_millis(2000));
             let mut changed = false;
+            let pin = std::env::var_os("NESTDESK_NOPIN").is_none();
             for w in surfaces(&handle) {
                 if let Ok(h) = w.hwnd() {
-                    unsafe { layer::pin_bottom(h.0 as *mut std::ffi::c_void) };
+                    unsafe {
+                        let ptr = h.0 as *mut std::ffi::c_void;
+                        if pin {
+                            use std::sync::{LazyLock, Mutex};
+                            use std::collections::HashSet;
+                            static STYLED: LazyLock<Mutex<HashSet<usize>>> =
+                                LazyLock::new(|| Mutex::new(HashSet::new()));
+                            let addr = ptr as usize;
+                            let mut set = STYLED.lock().unwrap();
+                            if !set.contains(&addr) {
+                                layer::ensure_layered(ptr);
+                                layer::style_surface(ptr);
+                                set.insert(addr);
+                            }
+                            drop(set);
+                            layer::pin_bottom(ptr);
+                        }
+                    }
                 }
                 if let (Ok(pos), Ok(size)) = (w.outer_position(), w.inner_size()) {
                     let g = Geom { x: pos.x, y: pos.y, w: size.width, h: size.height };
@@ -191,6 +209,39 @@ pub fn run() {
     });
 
     app.run(|_app, _event| {});
+}
+
+// ---------- --demo：真实桌面全链路（收取→分格→复原），JSON 证据输出后退出 ----------
+pub fn demo_run() {
+    let cfg = real_cfg();
+    let before = fs_core::snapshot(&cfg);
+    let res = fs_core::collect_desktop(&cfg);
+    println!("{}", serde_json::json!({
+        "phase": "collect",
+        "desktop_before": before.desktop_files,
+        "moved": res.moved.len(),
+        "failed": res.failed.len(),
+        "groups": res.moved.iter().map(|m| m.group).fold(std::collections::BTreeMap::new(), |mut acc, g| { *acc.entry(g).or_insert(0) += 1; acc }),
+        "batch": res.batch,
+    }));
+    let after = fs_core::snapshot(&cfg);
+    println!("{}", serde_json::json!({
+        "phase": "after_collect",
+        "inbox_groups": after.inbox.iter().map(|g| serde_json::json!({"group": g.group, "count": g.count})).collect::<Vec<_>>(),
+        "inbox_total": after.inbox_total,
+        "journal_len": after.journal_len,
+    }));
+    let undo = fs_core::undo_all(&cfg);
+    let restored = fs_core::snapshot(&cfg);
+    println!("{}", serde_json::json!({
+        "phase": "undo_all",
+        "restored": undo.restored,
+        "renamed": undo.renamed,
+        "missing": undo.missing,
+        "batches_left": undo.batches_left,
+        "desktop_after_undo": restored.desktop_files,
+        "inbox_after_undo": restored.inbox_total,
+    }));
 }
 
 // ---------- selftest：--selftest 全离线自测（A3/A4 自动化版，不碰真实桌面） ----------
@@ -229,9 +280,9 @@ pub fn selftest() {
     }
     let mut paths_b2: Vec<String> = Vec::new();
     for i in 0..80 {
-        let name = format!("dup_{}.txt", i % 40); // 每个名字出现两次 → 测 (2) 后缀
+        let name = format!("b2_{i}.txt");
         let p = alt.join(&name);
-        let content = format!("alt-{name}-{i}").into_bytes();
+        let content = format!("alt-{name}").into_bytes();
         fs::write(&p, &content).unwrap();
         paths_b2.push(p.to_string_lossy().to_string());
     }
@@ -239,7 +290,21 @@ pub fn selftest() {
     let r1 = fs_core::ingest(&cfg, paths_b1);
     report("批1: 120 文件全部归档", r1.moved.len() == 120 && r1.failed.is_empty(), format!("{} ok / {} fail", r1.moved.len(), r1.failed.len()));
     let r2 = fs_core::ingest(&cfg, paths_b2);
-    report("批2: 80 文件全部归档(含同名)", r2.moved.len() == 80, format!("{}", r2.moved.len()));
+    report("批2: 80 文件全部归档", r2.moved.len() == 80 && r2.failed.is_empty(), format!("{} ok / {} fail", r2.moved.len(), r2.failed.len()));
+
+    // 批3：跨批同名冲突——5 个与批1同名 + 5 个与批2同名（不同目录、不同内容）
+    let collide: Vec<String> = ["报告 0.docx", "photo_1.PNG", "data_3.unknownext", "setup_4.msi", "code_5.rs"]
+        .iter()
+        .map(|n| alt.join(n))
+        .chain((0..5).map(|i| alt.join(format!("b2_{i}.txt"))))
+        .map(|p| {
+            fs::write(&p, format!("collide-{}", p.file_name().unwrap().to_string_lossy()).into_bytes()).unwrap();
+            p.to_string_lossy().to_string()
+        })
+        .collect();
+    let r3 = fs_core::ingest(&cfg, collide);
+    let suffixed = r3.moved.iter().filter(|m| m.new.contains(" (2)")).count();
+    report("冲突: 跨批同名 10/10 全部带 (2) 后缀归档", r3.moved.len() == 10 && suffixed == 10, format!("moved={} suffixed={}", r3.moved.len(), suffixed));
 
     let ents = fs_core::read_entries(&cfg);
     let in_group = |name: &str, want: &str| ents.iter().any(|e| e.new.contains(&format!("{want}\\{name}")) || e.new.contains(&format!("{want}/{name}")));
@@ -247,10 +312,6 @@ pub fn selftest() {
     report("分类: 大写.PNG→图片", in_group("photo_1.PNG", "图片"), String::new());
     report("分类: unknownext→其他", in_group("data_3.unknownext", "其他"), String::new());
     report("分类: msi→安装包", in_group("setup_4.msi", "安装包"), String::new());
-
-    let d3 = ents.iter().filter(|e| e.old.contains("data_3")).count();
-    let d3suffixed = ents.iter().any(|e| e.new.contains("data_3.unknownext (2)"));
-    report("冲突: 同名批2落点带 (2) 后缀", d3 == 2 && d3suffixed, format!("d3={d3} suffixed={d3suffixed}"));
 
     // 删除一个已归档文件 → undo 计 missing 不崩
     let victim = ents[0].new.clone();

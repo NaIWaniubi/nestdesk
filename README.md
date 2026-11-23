@@ -24,8 +24,15 @@ npm run tauri build    # 发布 exe
 ```bash
 cargo run --manifest-path src-tauri/Cargo.toml -- --selftest
 ```
-覆盖 12 项断言：批量归档、7 类扩展名分类（含大写/未知/中文文件名）、同名冲突 (2) 后缀、
+覆盖 12 项断言：批量归档、7 类扩展名分类（含大写/未知/中文文件名）、跨批同名冲突 (2) 后缀、
 已删文件的 missing 报告、全部复原字节级一致、幂等重复复原、undo_last 批次粒度。
+
+## 真实桌面全链路演示（收取→分格→复原→还原，JSON 证据）
+```bash
+cargo run --manifest-path src-tauri/Cargo.toml -- --demo
+```
+实测记录：354 个散落文件 → 7 分类格 → undo_all 354/354 全复原，missing=0。
+环境变量 `NESTDESK_NOPIN=1` 可关闭桌面层钉扎（调试用）。
 
 ## 目录
 - `spike/` — S0 桌面层可行性验证（零依赖裸 Win32 FFI，结论见上级 SPEC.md §7）

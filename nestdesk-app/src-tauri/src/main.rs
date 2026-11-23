@@ -7,5 +7,9 @@ fn main() {
         nestdesk_app_lib::selftest();
         return;
     }
+    if args.iter().any(|a| a == "--demo") {
+        nestdesk_app_lib::demo_run();
+        return;
+    }
     nestdesk_app_lib::run()
 }

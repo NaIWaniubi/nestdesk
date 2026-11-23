@@ -147,6 +147,8 @@ function Shelf() {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [toast, setToast] = useState("");
   const [hot, setHot] = useState(false);
+  const [armed, setArmed] = useState(false);
+  const armTimer = useRef<number>(0);
   const [, cycle] = useTheme();
   const refresh = () => invoke<Snapshot>("shelf_snapshot").then(setSnap).catch(() => {});
   useEffect(() => {
@@ -198,7 +200,17 @@ function Shelf() {
           return `收取 ${x.moved.length} 个文件`;
         })}>⚡ 收取桌面</span>
         <span className="btn nodrag" onClick={() => act("复原上一批", () => invoke("shelf_undo_last"), undoRep)}>↩ 复原上批</span>
-        <span className="btn warn nodrag" onClick={() => { if (confirm("把【所有】归档过的文件放回原位？")) act("全部复原", () => invoke("shelf_undo_all"), undoRep); }}>⎌ 全部复原</span>
+        <span className="btn warn nodrag" onClick={() => {
+          if (!armed) {
+            setArmed(true);
+            window.clearTimeout(armTimer.current);
+            armTimer.current = window.setTimeout(() => setArmed(false), 3000);
+            setToast("再点一次将把所有归档文件放回原位");
+          } else {
+            setArmed(false);
+            act("全部复原", () => invoke("shelf_undo_all"), undoRep);
+          }
+        }}>{armed ? "⚠ 确认全部复原?" : "⎌ 全部复原"}</span>
       </div>
       <div className="shelf-body nodrag">
         {!snap && <div className="empty">载入中…</div>}

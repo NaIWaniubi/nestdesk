@@ -46,22 +46,56 @@ impl FileTimeT {
 }
 
 #[link(name = "user32")]
-extern "system" {
+unsafe extern "system" {
     fn SetWindowPos(hwnd: HWND, after: HWND, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
     fn IsWindow(hwnd: HWND) -> i32;
     fn IsIconic(hwnd: HWND) -> i32;
     fn ShowWindow(hwnd: HWND, cmd: i32) -> i32;
+    fn GetWindowLongPtrW(hwnd: HWND, idx: i32) -> isize;
+    fn SetWindowLongPtrW(hwnd: HWND, idx: i32, value: isize) -> isize;
+    fn SetLayeredWindowAttributes(hwnd: HWND, color_key: u32, alpha: u8, flags: u32) -> i32;
 }
 
 #[link(name = "kernel32")]
-extern "system" {
+unsafe extern "system" {
     fn GetSystemTimes(idle: *mut FileTimeT, kernel: *mut FileTimeT, user: *mut FileTimeT) -> i32;
     fn GlobalMemoryStatusEx(buf: *mut MemoryStatusEx) -> i32;
     fn GetSystemPowerStatus(sps: *mut SystemPowerStatus) -> i32;
 }
 
-/// 把窗口沉到桌面层（top-level + HWND_BOTTOM，S0 实测唯一可行方案），
-/// 被 Win+D 最小化后自动恢复。不移动、不改大小、不抢焦点。
+#[link(name = "dwmapi")]
+unsafe extern "system" {
+    fn DwmSetWindowAttribute(hwnd: HWND, attr: u32, pv: *const u32, cb: u32) -> i32;
+}
+
+/// Win11 DWM 圆角。注意：ACRYLIC backdrop 与 WS_EX_LAYERED+LWA_ALPHA 互斥，
+/// 曾导致窗口整体不进桌面合成（A/B 实测），故只设圆角、不设 backdrop。
+pub unsafe fn style_surface(h: HWND) {
+    if h.is_null() {
+        return;
+    }
+    let corner: u32 = 2; // DWMWCP_ROUND
+    DwmSetWindowAttribute(h, 33, &corner, 4);
+}
+
+/// 窗口扩展样式定型（仅应每窗执行一次；反复改写会破坏桌面合成，实测教训）。
+/// tauri transparent 窗口带 WS_EX_NOREDIRECTIONBITMAP(0x40000)，该样式窗口沉底后
+/// 不参与桌面合成（A/B 实测）。去掉它并补 WS_EX_LAYERED+LWA_ALPHA：
+/// 走分层合成路径，既保留 CSS 半透明，也能沉到桌面层。
+pub unsafe fn ensure_layered(h: HWND) {
+    if h.is_null() || IsWindow(h) == 0 {
+        return;
+    }
+    const EX_LAYERED: isize = 0x0008_0000;
+    const EX_NO_REDIR: isize = 0x0004_0000;
+    let ex = GetWindowLongPtrW(h, -20);
+    if (ex & EX_NO_REDIR) != 0 || (ex & EX_LAYERED) == 0 {
+        SetWindowLongPtrW(h, -20, (ex & !EX_NO_REDIR) | EX_LAYERED);
+        SetLayeredWindowAttributes(h, 0, 254, 0x2 /* LWA_ALPHA */);
+    }
+}
+
+/// 把窗口沉到桌面层，被 Win+D 最小化后自动恢复。不移动、不改大小、不抢焦点。
 pub unsafe fn pin_bottom(h: HWND) {
     if h.is_null() || IsWindow(h) == 0 {
         return;
