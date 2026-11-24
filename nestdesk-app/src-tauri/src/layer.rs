@@ -68,6 +68,16 @@ unsafe extern "system" {
     fn DwmSetWindowAttribute(hwnd: HWND, attr: u32, pv: *const u32, cb: u32) -> i32;
 }
 
+/// 按控制台设置实时刷新窗口不透明度（30..=255）。只改 LWA_ALPHA，
+/// 不碰扩展样式——扩展样式的反复改写会把窗口踢出桌面合成（实测教训）。
+pub unsafe fn set_alpha(h: HWND, alpha: u8) {
+    if h.is_null() || IsWindow(h) == 0 {
+        return;
+    }
+    let a = alpha.clamp(30, 255);
+    SetLayeredWindowAttributes(h, 0, a, 0x2 /* LWA_ALPHA */);
+}
+
 /// Win11 DWM 圆角。注意：ACRYLIC backdrop 与 WS_EX_LAYERED+LWA_ALPHA 互斥，
 /// 曾导致窗口整体不进桌面合成（A/B 实测），故只设圆角、不设 backdrop。
 pub unsafe fn style_surface(h: HWND) {

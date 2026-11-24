@@ -1,12 +1,13 @@
-// lib.rs — NestDesk v0：桌面层 surface 引擎 + 收纳归档 + journal 复原 + 小组件
+// lib.rs — NestDesk v0：桌面层 surface 引擎 + 收纳归档 + journal 复原 + 小组件 + 控制台设置
 mod fs_core;
 mod layer;
 
 use fs_core::{Config, IngestResult, Snapshot, UndoReport};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::Duration;
 use tauri::{Manager, PhysicalPosition, PhysicalSize, Position, Size};
 
@@ -36,11 +37,82 @@ fn desktop_dir() -> PathBuf {
         });
     found.unwrap_or_else(|| user_home().join("Desktop"))
 }
+
+// ---------- 控制台设置（分组表 + 每面板透明度） ----------
+#[derive(Serialize, Deserialize, Clone)]
+struct GroupRule { name: String, exts: Vec<String> }
+
+#[derive(Serialize, Deserialize, Clone)]
+struct AppSettings {
+    groups: Vec<GroupRule>,
+    /// 每个面板的窗口级不透明度（30..=255，LWA_ALPHA）
+    alpha: HashMap<String, u32>,
+}
+
+fn settings_path() -> PathBuf { data_dir().join("settings.json") }
+
+fn settings_defaults() -> AppSettings {
+    let groups: Vec<GroupRule> = fs_core::default_groups().iter()
+        .map(|(n, e)| GroupRule { name: n.clone(), exts: e.clone() })
+        .collect();
+    let alpha = [("shelf", 254u32), ("clock", 250), ("sysmon", 250), ("note", 250)]
+        .iter().map(|(k, v)| (k.to_string(), *v)).collect();
+    AppSettings { groups, alpha }
+}
+
+static SETTINGS: OnceLock<RwLock<AppSettings>> = OnceLock::new();
+
+fn init_settings() {
+    if SETTINGS.get().is_some() {
+        return;
+    }
+    let path = settings_path();
+    let base = if path.exists() {
+        fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<AppSettings>(&s).ok())
+            .unwrap_or_else(settings_defaults)
+    } else {
+        settings_defaults()
+    };
+    // 自愈：至少保留「其他」兜底格与四个面板键
+    let mut s = base;
+    if !s.groups.iter().any(|g| g.name == "其他") {
+        s.groups.push(GroupRule { name: "其他".into(), exts: vec![] });
+    }
+    for k in SURFACES {
+        s.alpha.entry(k.to_string()).or_insert(250);
+    }
+    let _ = SETTINGS.set(RwLock::new(s));
+    save_settings_file();
+}
+
+fn current_settings() -> AppSettings {
+    SETTINGS.get().map(|r| r.read().unwrap().clone()).unwrap_or_else(settings_defaults)
+}
+
+fn save_settings_file() {
+    if let Some(r) = SETTINGS.get() {
+        let s = r.read().unwrap().clone();
+        if let Ok(txt) = serde_json::to_string_pretty(&s) {
+            let tmp = settings_path().with_extension("json.tmp");
+            let _ = fs::write(&tmp, txt);
+            let bak = settings_path().with_extension("json.bak");
+            let main = settings_path();
+            if main.exists() { let _ = fs::rename(&main, bak); }
+            let _ = fs::rename(&tmp, &main);
+        }
+    }
+}
+
 fn real_cfg() -> Config {
+    let s = current_settings();
+    let groups: Vec<(String, Vec<String>)> = s.groups.into_iter().map(|g| (g.name, g.exts)).collect();
     Config {
         desktop: desktop_dir(),
         inbox_root: user_home().join("Nest").join("收件箱"),
         journal: data_dir().join("journal.jsonl"),
+        groups: Some(groups),
     }
 }
 
@@ -137,16 +209,46 @@ fn save_layout(map: &HashMap<String, Geom>) {
     }
 }
 
+#[tauri::command]
+fn settings_get() -> AppSettings {
+    init_settings();
+    current_settings()
+}
+
+#[tauri::command]
+fn settings_save(groups: Vec<GroupRule>, alpha: HashMap<String, u32>) -> AppSettings {
+    if groups.is_empty() {
+        return current_settings();
+    }
+    let mut s = current_settings();
+    s.groups = groups;
+    for k in SURFACES {
+        s.alpha.entry(k.to_string()).or_insert(250);
+    }
+    for (k, v) in &alpha {
+        if *v >= 30 && *v <= 255 {
+            s.alpha.insert(k.clone(), *v);
+        }
+    }
+    if let Some(r) = SETTINGS.get() {
+        *r.write().unwrap() = s.clone();
+    }
+    save_settings_file();
+    s
+}
+
 fn surfaces(app: &tauri::AppHandle) -> Vec<tauri::WebviewWindow> {
     SURFACES.iter().filter_map(|l| app.get_webview_window(l)).collect()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    init_settings();
     let app = tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             shelf_snapshot, shelf_ingest, shelf_collect_desktop, shelf_undo_last, shelf_undo_all,
-            get_sysinfo, note_get, note_set, theme_get, theme_set
+            get_sysinfo, note_get, note_set, theme_get, theme_set,
+            settings_get, settings_save
         ])
         .build(tauri::generate_context!())
         .expect("NestDesk 启动失败");
@@ -185,6 +287,14 @@ pub fn run() {
                                 set.insert(addr);
                             }
                             drop(set);
+                            // 透明度实时跟随控制台设置（只改 LWA_ALPHA，不动扩展样式）
+                            let alpha = current_settings()
+                                .alpha
+                                .get(w.label())
+                                .copied()
+                                .unwrap_or(250)
+                                .clamp(30, 255) as u8;
+                            layer::set_alpha(ptr, alpha);
                             layer::pin_bottom(ptr);
                         }
                     }
@@ -213,6 +323,7 @@ pub fn run() {
 
 // ---------- --demo：真实桌面全链路（收取→分格→复原），JSON 证据输出后退出 ----------
 pub fn demo_run() {
+    init_settings();
     let cfg = real_cfg();
     let before = fs_core::snapshot(&cfg);
     let res = fs_core::collect_desktop(&cfg);
@@ -221,7 +332,7 @@ pub fn demo_run() {
         "desktop_before": before.desktop_files,
         "moved": res.moved.len(),
         "failed": res.failed.len(),
-        "groups": res.moved.iter().map(|m| m.group).fold(std::collections::BTreeMap::new(), |mut acc, g| { *acc.entry(g).or_insert(0) += 1; acc }),
+        "groups": res.moved.iter().map(|m| m.group.clone()).fold(std::collections::BTreeMap::new(), |mut acc, g| { *acc.entry(g).or_insert(0) += 1; acc }),
         "batch": res.batch,
     }));
     let after = fs_core::snapshot(&cfg);
@@ -253,7 +364,7 @@ pub fn selftest() {
     let alt = root.join("alt");
     let _ = fs::create_dir_all(&desktop);
     let _ = fs::create_dir_all(&alt);
-    let cfg = Config { desktop: desktop.clone(), inbox_root: inbox.clone(), journal: root.join("journal.jsonl") };
+    let cfg = Config { desktop: desktop.clone(), inbox_root: inbox.clone(), journal: root.join("journal.jsonl"), groups: None };
 
     let mut checks: Vec<serde_json::Value> = Vec::new();
     let mut report = |name: &str, ok: bool, info: String| {
@@ -312,6 +423,29 @@ pub fn selftest() {
     report("分类: 大写.PNG→图片", in_group("photo_1.PNG", "图片"), String::new());
     report("分类: unknownext→其他", in_group("data_3.unknownext", "其他"), String::new());
     report("分类: msi→安装包", in_group("setup_4.msi", "安装包"), String::new());
+
+    // 控制台自定义分组表（用户可自由增删归纳文件夹）
+    let custom: Vec<(String, Vec<String>)> = vec![
+        ("论文".to_string(), vec!["pdf".to_string(), "docx".to_string()]),
+        ("数据集".to_string(), vec![]),
+    ];
+    let mut cfg_custom = cfg.clone();
+    cfg_custom.groups = Some(custom);
+    let samples: [(&str, &[u8]); 4] = [
+        ("论文.txt", b"paper"), ("论文.pdf", b"paper2"),
+        ("数据.bin", b"data"), ("杂项.zip", b"zip"),
+    ];
+    for (n, e) in samples.iter() {
+        let p = alt.join(n);
+        fs::write(&p, e.to_vec()).unwrap();
+    }
+    let rc = fs_core::ingest(&cfg_custom, ["论文.txt", "论文.pdf", "数据.bin", "杂项.zip"]
+        .iter().map(|n| alt.join(n).to_string_lossy().to_string()).collect());
+    let n_paper = rc.moved.iter().filter(|m| m.group == "论文").count();
+    let n_data = rc.moved.iter().filter(|m| m.group == "数据集").count();
+    report("自定分组: pdf→「论文」，其余落入表尾「数据集」兜底",
+        rc.moved.len() == 4 && n_paper == 1 && n_data == 3,
+        format!("paper={n_paper} data={n_data}"));
 
     // 删除一个已归档文件 → undo 计 missing 不崩
     let victim = ents[0].new.clone();

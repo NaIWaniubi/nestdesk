@@ -240,11 +240,117 @@ function Shelf() {
   );
 }
 
+// ---------- 控制台设置 ----------
+interface GroupRule { name: string; exts: string[] }
+interface AppSettings { groups: GroupRule[]; alpha: Record<string, number> }
+const ALPHA_KEYS = [
+  ["shelf", "收纳框"], ["clock", "时钟"], ["sysmon", "系统监视"], ["note", "便利贴"],
+] as const;
+
+function Settings() {
+  const [groups, setGroups] = useState<GroupRule[]>([]);
+  const [alpha, setAlpha] = useState<Record<string, number>>({});
+  const [saved, setSaved] = useState("");
+
+  useEffect(() => {
+    invoke<AppSettings>("settings_get").then((s) => {
+      setGroups(s.groups);
+      setAlpha(s.alpha);
+    });
+  }, []);
+
+  const updateExts = (i: number, raw: string) => {
+    const exts = raw.split(/[,，\s]+/).map((e) => e.trim().toLowerCase()).filter(Boolean);
+    setGroups((gs) => gs.map((g, j) => (j === i ? { ...g, exts } : g)));
+  };
+  const addGroup = () => setGroups((gs) => [...gs, { name: "", exts: [] }]);
+  const removeGroup = (i: number) =>
+    setGroups((gs) => (gs.length <= 1 ? gs : gs.filter((_, j) => j !== i)));
+
+  const save = async () => {
+    // 校验：空名行跳过；至少要有一格
+    const clean = groups.map((g) => ({ ...g, name: g.name.trim() })).filter((g) => g.name);
+    if (clean.length === 0) {
+      setSaved("至少要保留一个归纳文件夹");
+      return;
+    }
+    if (!clean.some((g) => g.name === "其他")) {
+      clean.push({ name: "其他", exts: [] }); // 兜底格，保证未匹配文件有归宿
+    }
+    await invoke("settings_save", { groups: clean, alpha });
+    setGroups(clean);
+    setSaved(`✓ 已保存：${clean.length} 个归纳文件夹，透明度即时生效`);
+  };
+
+  return (
+    <div className="card" style={{ overflow: "auto" }}>
+      <div className="head"><b>🏠 归巢 · 控制台</b><span className="sp" /></div>
+
+      <div style={{ padding: "4px 14px 8px", fontSize: 12, color: "var(--dim)" }}>
+            归纳文件夹 = 文件归档的分类格。扩展名空格或逗号分隔；「其他」是未匹配文件的兜底格（自动追加、不可删）。
+          </div>
+      <div style={{ padding: "0 14px 10px" }}>
+        {groups.map((g, i) => (
+          <div key={i} style={{ display: "flex", gap: 6, marginBottom: 6, alignItems: "center" }}>
+            <input className="nodrag"
+              style={{ flex: 1, background: "var(--bar-bg)", border: "1px solid var(--border)",
+                color: "var(--text)", borderRadius: 8, padding: "6px 9px", fontSize: 12, outline: "none" }}
+              value={g.name}
+              onChange={(e) => setGroups((gs) => gs.map((h, j) => (j === i ? { ...h, name: e.target.value } : h)))}
+              placeholder="文件夹名，如「论文」" />
+            <input className="nodrag"
+              style={{ flex: 2, background: "var(--bar-bg)", border: "1px solid var(--border)",
+                color: "var(--text)", borderRadius: 8, padding: "6px 9px", fontSize: 12, outline: "none" }}
+              value={g.exts.join(" ")}
+              onChange={(e) => updateExts(i, e.target.value)}
+              placeholder="扩展名，如 pdf doc png" />
+            <span className="btn nodrag" onClick={() => removeGroup(i)}>✕</span>
+          </div>
+        ))}
+        <span className="btn nodrag" onClick={addGroup}>＋ 添加归纳文件夹</span>
+      </div>
+
+      <div style={{ padding: "0 14px 8px", fontSize: 12, color: "var(--dim)" }}>面板透明度（实时生效）</div>
+      <div style={{ padding: "0 14px 10px" }}>
+        {ALPHA_KEYS.map(([k, label]) => (
+          <div key={k} className="mon-row" style={{ marginBottom: 4 }}>
+            <div className="lbl"><span>{label}</span><span>{Math.round((alpha[k] ?? 250) / 255 * 100)}%</span></div>
+            <input type="range" min={30} max={255}
+              style={{ width: "100%", accentColor: "var(--accent)" }}
+              value={alpha[k] ?? 250}
+              onChange={(e) => setAlpha((a) => ({ ...a, [k]: Number(e.target.value) }))} />
+          </div>
+        ))}
+      </div>
+
+      <div style={{ padding: "0 14px 8px", fontSize: 12, color: "var(--dim)" }}>皮肤</div>
+      <div style={{ padding: "0 14px 12px", display: "flex", gap: 8 }}>
+        {(["night", "sunset", "contrast", "mist"] as const).map((t) => (
+          <span key={t} className="btn nodrag"
+            onClick={() => {
+              document.documentElement.dataset.theme = t;
+              invoke("theme_set", { theme: t });
+              setSaved(`皮肤：${({ night: "夜航", sunset: "落日晚霞", contrast: "高对比", mist: "雨雾" } as Record<string, string>)[t]}（即时生效）`);
+            }}>
+            {({ night: "夜航", sunset: "落日晚霞", contrast: "高对比", mist: "雨雾" } as Record<string, string>)[t]}
+          </span>
+        ))}
+      </div>
+
+      <div style={{ padding: "0 14px 16px" }}>
+        <span className="btn nodrag" onClick={save} style={{ padding: "8px 22px" }}>💾 保存设置</span>
+      </div>
+      <div className="toast">{saved || "设置会随窗口位置自动记忆"}</div>
+    </div>
+  );
+}
+
 export default function App() {
   const label = getCurrentWindow().label;
   if (label === "shelf") return <Shelf />;
   if (label === "clock") return <Clock />;
   if (label === "sysmon") return <Sysmon />;
   if (label === "note") return <Note />;
+  if (label === "settings") return <Settings />;
   return <div className="card"><div className="head">未知面板 {label}</div></div>;
 }

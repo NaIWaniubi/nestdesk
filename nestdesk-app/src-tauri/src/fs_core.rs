@@ -10,6 +10,7 @@ pub struct Config {
     pub desktop: PathBuf,   // 散落文件来源
     pub inbox_root: PathBuf, // 归档目标根（Nest/收件箱）
     pub journal: PathBuf,    // 事务日志（JSONL，append）
+    pub groups: Option<Vec<(String, Vec<String>)>>, // 控制台自定义分组表；None=内置默认
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -21,7 +22,7 @@ pub struct Entry {
 }
 
 #[derive(Serialize, Clone, Debug)]
-pub struct Moved { pub old: String, pub new: String, pub group: &'static str }
+pub struct Moved { pub old: String, pub new: String, pub group: String }
 #[derive(Serialize, Clone, Debug)]
 pub struct Failed { pub path: String, pub reason: String }
 #[derive(Serialize, Clone, Debug)]
@@ -29,24 +30,47 @@ pub struct IngestResult { pub batch: String, pub moved: Vec<Moved>, pub failed: 
 #[derive(Serialize, Clone, Debug)]
 pub struct UndoReport { pub restored: usize, pub renamed: usize, pub missing: Vec<String>, pub batches_left: usize }
 
-pub fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+/// 内置默认分组（= 分类体系底稿，控制台可增删改）
+pub fn default_groups() -> Vec<(String, Vec<String>)> {
+    vec![
+        ("图片".to_string(), vec!["png","jpg","jpeg","gif","webp","bmp","ico","svg","tiff","heic"].iter().map(|s| s.to_string()).collect()),
+        ("文档".to_string(), vec!["pdf","doc","docx","xls","xlsx","ppt","pptx","txt","md","rtf","csv","epub","odt"].iter().map(|s| s.to_string()).collect()),
+        ("压缩包".to_string(), vec!["zip","rar","7z","tar","gz","bz2","xz","iso"].iter().map(|s| s.to_string()).collect()),
+        ("安装包".to_string(), vec!["exe","msi","appx","msix"].iter().map(|s| s.to_string()).collect()),
+        ("视频".to_string(), vec!["mp4","mkv","avi","mov","wmv","flv","webm"].iter().map(|s| s.to_string()).collect()),
+        ("音频".to_string(), vec!["mp3","wav","flac","aac","ogg","m4a"].iter().map(|s| s.to_string()).collect()),
+        ("代码".to_string(), vec!["js","ts","tsx","jsx","json","rs","py","go","java","c","h","cpp","cs","html","css","sh","bat","ps1","sql","toml","yaml","yml"].iter().map(|s| s.to_string()).collect()),
+        ("文件夹".to_string(), vec![]),
+        ("其他".to_string(), vec![]),
+    ]
 }
 
-pub fn group_of(p: &Path) -> &'static str {
+/// 按控制台配置的分组表归类；无匹配 → 「其他」（或表尾）
+pub fn group_resolve(p: &Path, groups: &[(String, Vec<String>)]) -> String {
     if p.is_dir() {
-        return "文件夹";
+        return if groups.iter().any(|(n, _)| n == "文件夹") {
+            "文件夹".to_string()
+        } else {
+            groups.last().map(|(n, _)| n.clone()).unwrap_or_else(|| "其他".into())
+        };
     }
-    match p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
-        Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("webp") | Some("bmp") | Some("ico") | Some("svg") | Some("tiff") | Some("heic") => "图片",
-        Some("pdf") | Some("doc") | Some("docx") | Some("xls") | Some("xlsx") | Some("ppt") | Some("pptx") | Some("txt") | Some("md") | Some("rtf") | Some("csv") | Some("epub") | Some("odt") => "文档",
-        Some("zip") | Some("rar") | Some("7z") | Some("tar") | Some("gz") | Some("bz2") | Some("xz") | Some("iso") => "压缩包",
-        Some("exe") | Some("msi") | Some("appx") | Some("msix") => "安装包",
-        Some("mp4") | Some("mkv") | Some("avi") | Some("mov") | Some("wmv") | Some("flv") | Some("webm") => "视频",
-        Some("mp3") | Some("wav") | Some("flac") | Some("aac") | Some("ogg") | Some("m4a") => "音频",
-        Some("js") | Some("ts") | Some("tsx") | Some("jsx") | Some("json") | Some("rs") | Some("py") | Some("go") | Some("java") | Some("c") | Some("h") | Some("cpp") | Some("cs") | Some("html") | Some("css") | Some("sh") | Some("bat") | Some("ps1") | Some("sql") | Some("toml") | Some("yaml") | Some("yml") => "代码",
-        _ => "其他",
+    let ext = p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+    if let Some(e) = ext {
+        for (n, exts) in groups {
+            if exts.contains(&e) {
+                return n.clone();
+            }
+        }
     }
+    if groups.iter().any(|(n, _)| n == "其他") {
+        "其他".to_string()
+    } else {
+        groups.last().map(|(n, _)| n.clone()).unwrap_or_else(|| "其他".into())
+    }
+}
+
+pub fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 fn split_name(name: &str) -> (String, String) {
@@ -132,8 +156,9 @@ pub fn ingest(cfg: &Config, paths: Vec<String>) -> IngestResult {
         if src.starts_with(&cfg.inbox_root) {
             continue;
         }
-        let g = group_of(&src);
-        let dest = unique_dest(&cfg.inbox_root.join(g), &name);
+        let groups = cfg.groups.clone().unwrap_or_else(default_groups);
+        let g = group_resolve(&src, &groups);
+        let dest = unique_dest(&cfg.inbox_root.join(&g), &name);
         match move_any(&src, &dest) {
             Ok(()) => {
                 let new = dest.to_string_lossy().to_string();

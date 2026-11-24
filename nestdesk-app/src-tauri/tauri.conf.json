@@ -66,6 +66,17 @@
         "resizable": false,
         "shadow": false,
         "focus": false
+      },
+      {
+        "label": "settings",
+        "title": "归巢 · 控制台",
+        "width": 660,
+        "height": 780,
+        "x": 1080,
+        "y": 90,
+        "transparent": false,
+        "decorations": true,
+        "resizable": true
       }
     ],
     "security": {
