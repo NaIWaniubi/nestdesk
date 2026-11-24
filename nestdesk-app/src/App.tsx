@@ -42,8 +42,15 @@ const GROUP_ICON: Record<string, string> = {
 function Clock() {
   const [, cycle] = useTheme();
   const [now, setNow] = useState(new Date());
+  const [lunar, setLunar] = useState("");
   useEffect(() => {
     const t = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  // Glance：每天一次走 .NET 原生日历取农历（DeskBox Glance 同款思路，零数据风险）
+  useEffect(() => {
+    invoke<string>("lunar_now").then(setLunar).catch(() => {});
+    const t = setInterval(() => invoke<string>("lunar_now").then(setLunar).catch(() => {}), 3600_000);
     return () => clearInterval(t);
   }, []);
   const wd = ["日", "一", "二", "三", "四", "五", "六"][now.getDay()];
@@ -55,6 +62,7 @@ function Clock() {
       <div className="clock-body">
         <div className="clock-time">{pad(now.getHours())}:{pad(now.getMinutes())}<span style={{ fontSize: 20 }}>:{pad(now.getSeconds())}</span></div>
         <div className="clock-date">{now.getFullYear()}–{pad(now.getMonth() + 1)}–{pad(now.getDate())} 周{wd}</div>
+        {lunar && <div className="clock-date" style={{ color: "var(--accent)" }}>{lunar}</div>}
       </div>
     </div>
   );
@@ -173,6 +181,28 @@ function Shelf() {
     return () => un?.();
   }, []);
 
+  // S-B: 浏览器里把链接拖到收纳框 → 下载归档（DeskBox 多来源拖放）
+  const handleUrlDrop = async (e: React.DragEvent) => {
+    const urls: string[] = [];
+    const raw = e.dataTransfer.getData("text/uri-list") || e.dataTransfer.getData("text/plain");
+    for (const line of raw.split(/\r?\n/)) {
+      const u = line.trim();
+      if (/^https?:\/\//i.test(u)) urls.push(u);
+    }
+    if (!urls.length) return;
+    e.preventDefault();
+    setToast("下载归档中…");
+    let okN = 0, badN = 0;
+    for (const u of urls) {
+      try {
+        const r = await invoke<IngestResult>("shelf_save_url", { url: u });
+        okN += r.moved.length; badN += r.failed.length;
+      } catch { badN++; }
+    }
+    setToast(`链接已下载 ${okN} 个` + (badN ? `，${badN} 个失败` : ""));
+    refresh();
+  };
+
   const act = async (name: string, fn: () => Promise<unknown>, ok: (r: unknown) => string) => {
     setToast(name + "…");
     try {
@@ -189,7 +219,9 @@ function Shelf() {
   };
 
   return (
-    <div className={"card" + (hot ? " drop-hot" : "")}>
+    <div className={"card" + (hot ? " drop-hot" : "")}
+      onDragOver={(e) => { e.preventDefault(); }}
+      onDrop={handleUrlDrop}>
       <div className="head grab">
         <b>🏠 归巢 · 桌面收件箱</b><span className="sp" />
         <span className="badge nodrag" onClick={cycle} title="换肤">◐</span>
@@ -338,6 +370,17 @@ function Settings() {
     await invoke("settings_save", { groups: clean, alpha }); setGroups(clean); setSaved(`✓ 已保存：${clean.length} 个归纳文件夹`);
   };
 
+  // ---- 音乐宿主（S-E）：启动 Folia 或配置的播放器 ----
+  const [player, setPlayer] = useState("");
+  const openMusic = async () => {
+    try { setMsg(await invoke<string>("music_open")); }
+    catch (e) { setMsg(String(e)); }
+  };
+  const savePlayer = async () => {
+    if (!player.trim()) return;
+    setSaved(await invoke<string>("music_set", { path: player.trim() }));
+  };
+
   const tabs: { k: Tab; label: string }[] = [
     { k: "桌面", label: "桌面" }, { k: "归纳", label: "归纳" }, { k: "事务", label: "事务" },
     { k: "查重", label: "查重" }, { k: "更多", label: "更多" },
@@ -448,7 +491,16 @@ function Settings() {
                   value={alpha[k] ?? 250} onChange={(e) => setAlpha((a) => ({ ...a, [k]: Number(e.target.value) }))} />
               </div>
             ))}
-            <div style={{ fontSize: 12, color: "var(--dim)", margin: "12px 0 8px" }}>皮肤</div>
+            <div style={{ fontSize: 12, color: "var(--dim)", margin: "12px 0 8px" }}>音乐（S-E：Folia/其他播放器托管）</div>
+            <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 6 }}>
+              <input className="nodrag" style={{ flex: 1, background: "var(--bar-bg)", border: "1px solid var(--border)", color: "var(--text)", borderRadius: 8, padding: "6px 9px", fontSize: 12 }}
+                placeholder="播放器 exe 完整路径，如 E:\myzcodeoliaolia.exe" value={player}
+                onChange={(e) => setPlayer(e.target.value)} />
+              <span className="btn nodrag" onClick={savePlayer}>存路径</span>
+            </div>
+            <span className="btn nodrag" onClick={openMusic} style={{ marginRight: 8 }}>▶ 打开音乐</span>
+            <div style={{ fontSize: 10, color: "var(--dim)", marginTop: 4 }}>留空则用系统默认；推荐 Folia（github.com/chthollyphile/folia-major，AGPL）。</div>
+
             <div style={{ display: "flex", gap: 8 }}>
               {(["night", "sunset", "contrast", "mist"] as const).map((t) => (
                 <span key={t} className="btn nodrag" onClick={() => { document.documentElement.dataset.theme = t; invoke("theme_set", { theme: t }); setSaved(`皮肤：${({ night: "夜航", sunset: "落日晚霞", contrast: "高对比", mist: "雨雾" } as Record<string, string>)[t]}`); }}>
@@ -478,6 +530,48 @@ function downloadText(name: string, text: string) {
 }
 
 
+// ---------- Todo（S-D，DeskBox 快捷捕获范式）----------
+interface TodoT { text: string; done: boolean; created: number }
+function Todo() {
+  const [list, setList] = useState<TodoT[]>([]);
+  const [text, setText] = useState("");
+  const [, cycle] = useTheme();
+  const reload = () => invoke<TodoT[]>("todo_list").then(setList).catch(() => {});
+  useEffect(() => { reload(); }, []);
+  const add = async () => {
+    if (!text.trim()) return;
+    setList(await invoke<TodoT[]>("todo_add", { text: text.trim() }));
+    setText("");
+  };
+  return (
+    <div className="card grab">
+      <div className="head"><b>✔ 待办</b><span className="sp" />
+        <span className="badge nodrag" onClick={cycle} title="换肤">◐</span>
+      </div>
+      <div style={{ padding: "0 12px 8px" }}>
+        <div style={{ display: "flex", gap: 6 }}>
+          <input className="nodrag" style={{ flex: 1, background: "var(--bar-bg)", border: "1px solid var(--border)", color: "var(--text)", borderRadius: 8, padding: "6px 9px", fontSize: 12, outline: "none" }}
+            placeholder="记一条…回车收录" value={text}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") add(); }} />
+          <span className="btn nodrag" onClick={add}>＋</span>
+        </div>
+      </div>
+      <div className="shelf-body nodrag">
+        {list.length === 0 && <div style={{ fontSize: 11, color: "var(--dim)", padding: 8 }}>空空如也<br />桌面想到什么随时记</div>}
+        {list.map((t, i) => (
+          <label key={i} style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 12, padding: "4px 0" }}>
+            <input type="checkbox" checked={t.done} onChange={() => invoke("todo_toggle", { i }).then(reload)} />
+            <span style={{ flex: 1, textDecoration: t.done ? "line-through" : "none", opacity: t.done ? 0.5 : 1 }}>{t.text}</span>
+            <span className="btn nodrag" onClick={() => invoke("todo_del", { i }).then(reload)}>✕</span>
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+
 export default function App() {
   const label = getCurrentWindow().label;
   if (label === "shelf") return <Shelf />;
@@ -485,5 +579,6 @@ export default function App() {
   if (label === "sysmon") return <Sysmon />;
   if (label === "note") return <Note />;
   if (label === "settings") return <Settings />;
+  if (label === "todo") return <Todo />;
   return <div className="card"><div className="head">未知面板 {label}</div></div>;
 }

@@ -3,6 +3,7 @@ mod fs_core;
 mod layer;
 
 use fs_core::{Config, DeskItem, DupSet, GroupRule2, IngestResult, Snapshot, SuggestPlan, UndoReport};
+use std::process::Command;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -11,7 +12,7 @@ use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::Duration;
 use tauri::{Manager, PhysicalPosition, PhysicalSize, Position, Size};
 
-pub const SURFACES: [&str; 4] = ["shelf", "clock", "sysmon", "note"];
+pub const SURFACES: [&str; 5] = ["shelf", "clock", "sysmon", "note", "todo"];
 
 // ---------- 应用级路径 ----------
 fn appdata() -> PathBuf {
@@ -305,6 +306,128 @@ fn settings_save(groups: Vec<GroupRule>, alpha: HashMap<String, u32>) -> AppSett
     s
 }
 
+// ---------- v0.4 fusion commands ----------
+#[tauri::command]
+fn shelf_save_url(url: String) -> IngestResult {
+    init_settings();
+    let s = current_settings();
+    let groups: Vec<(String, Vec<String>)> = s.groups.iter().map(|g| (g.name.clone(), g.exts.clone())).collect();
+    fs_core::save_url(&real_cfg(), &groups, &url)
+}
+
+// ---- Glance: 农历（.NET ChineseLunisolarCalendar，零数据风险）----
+const LUNAR_MONTHS: [&str; 12] = ["正", "二", "三", "四", "五", "六", "七", "八", "九", "十", "冬", "腊"];
+const LUNAR_DAYS: [&str; 30] = [
+    "初一","初二","初三","初四","初五","初六","初七","初八","初九","初十",
+    "十一","十二","十三","十四","十五","十六","十七","十八","十九","二十",
+    "廿一","廿二","廿三","廿四","廿五","廿六","廿七","廿八","廿九","三十",
+];
+const ZODIAC: [&str; 12] = ["鼠","牛","虎","兔","龙","蛇","马","羊","猴","鸡","狗","猪"];
+
+#[tauri::command]
+fn lunar_now() -> String {
+    let script = "$c=New-Object System.Globalization.ChineseLunisolarCalendar; $d=Get-Date; $leap=$c.GetLeapMonth($c.GetYear($d)); '{0}|{1}|{2}|{3}|{4}' -f $c.GetYear($d), $c.GetMonth($d), $c.GetDayOfMonth($d), $leap, ([int]$d.DayOfWeek)";
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output();
+    let Ok(o) = out else { return String::new() };
+    let s = String::from_utf8_lossy(&o.stdout);
+    let parts: Vec<&str> = s.trim().split('|').collect();
+    if parts.len() < 4 { return String::new() }
+    let y: i32 = parts[0].trim().parse().unwrap_or(0);
+    let m: u32 = parts[1].trim().parse().unwrap_or(0);
+    let d: u32 = parts[2].trim().parse().unwrap_or(0);
+    if y < 1900 || y > 2100 || m == 0 || d == 0 { return String::new() }
+    let leap_month: u32 = parts[3].trim().parse().unwrap_or(0);
+    let mi = ((m - 1) as usize).min(11);
+    let is_leap = leap_month != 0 && m == leap_month;
+    format!("{}{}月{} · {}年", if is_leap {"闰"} else {""}, LUNAR_MONTHS[mi], LUNAR_DAYS[(d as usize).saturating_sub(1)], ZODIAC[(((y - 4)).rem_euclid(12)) as usize])
+}
+
+// ---- Music host path config ----
+#[tauri::command]
+fn music_set(path: String) -> String {
+    let cfg_path = data_dir().join("config.json");
+    let mut map = serde_json::Map::new();
+    if let Ok(txt) = std::fs::read_to_string(&cfg_path) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+            if let Some(obj) = v.as_object() { map = obj.clone(); }
+        }
+    }
+    map.insert("player".into(), serde_json::Value::String(path));
+    let _ = std::fs::write(&cfg_path, serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap_or_default());
+    "已保存播放器路径".into()
+}
+
+// ---- Todo (S-D) ----
+#[derive(Serialize, Deserialize, Clone)]
+struct TodoItem { text: String, done: bool, created: u64 }
+#[tauri::command]
+fn todo_list() -> Vec<TodoItem> {
+    let p = data_dir().join("todo.json");
+    std::fs::read_to_string(&p).ok()
+        .and_then(|t| serde_json::from_str::<Vec<TodoItem>>(&t).ok())
+        .unwrap_or_default()
+}
+#[tauri::command]
+fn todo_add(text: String) -> Vec<TodoItem> {
+    let mut list = todo_list();
+    list.insert(0, TodoItem { text, done: false, created: fs_core::now_ms() });
+    if list.len() > 100 { list.truncate(100); }
+    save_todo(&list);
+    list
+}
+#[tauri::command]
+fn todo_toggle(i: usize) -> Vec<TodoItem> {
+    let mut list = todo_list();
+    if i < list.len() { list[i].done = !list[i].done; }
+    save_todo(&list);
+    list
+}
+#[tauri::command]
+fn todo_del(i: usize) -> Vec<TodoItem> {
+    let mut list = todo_list();
+    if i < list.len() { list.remove(i); }
+    save_todo(&list);
+    list
+}
+
+fn save_todo(list: &[TodoItem]) {
+    let tmp = data_dir().join("todo.json.tmp");
+    if let Ok(txt) = serde_json::to_string_pretty(list) {
+        let _ = std::fs::write(&tmp, txt);
+        let main = data_dir().join("todo.json");
+        let _ = std::fs::rename(&tmp, &main);
+    }
+}
+
+// ---- Music host (S-E): launches Folia or configured player ----
+#[tauri::command]
+fn music_open() -> Result<String, String> {
+    let cfg_path = data_dir().join("config.json");
+    let raw_player = std::fs::read_to_string(&cfg_path).ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("player").and_then(|p| p.as_str()).map(String::from))
+        .filter(|p| !p.is_empty());
+    // 缺省顺序：配置的 player（必须存在且是文件）→ 系统默认 Windows Media Player。
+    // 路径无效时返回明确指引，UI 可提示到控制台「更多」里重新保存。
+    let target = match raw_player.as_deref() {
+        Some(p) if std::path::Path::new(p).is_file() => p,
+        Some(p) => return Err(format!("播放器路径不存在: {p} —— 在控制台「更多」标签里重新保存路径")),
+        None => "wmplayer",
+    };
+    let mut cmd = Command::new(target);
+    let out;
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        out = cmd.creation_flags(0x0800_0008 /* DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP */).spawn();
+    }
+    #[cfg(not(windows))]
+    { out = cmd.spawn(); }
+    out.map(|_| format!("started: {target}")).map_err(|e| format!("failed: {e}"))
+}
+
 fn surfaces(app: &tauri::AppHandle) -> Vec<tauri::WebviewWindow> {
     SURFACES.iter().filter_map(|l| app.get_webview_window(l)).collect()
 }
@@ -318,7 +441,9 @@ pub fn run() {
             get_sysinfo, note_get, note_set, theme_get, theme_set,
             settings_get, settings_save,
             shelf_desk_items, plan_suggest, yaml_export, yaml_import,
-            shelf_batches, shelf_undo_selected, dup_scan, dup_archive
+            shelf_batches, shelf_undo_selected, dup_scan, dup_archive,
+            shelf_save_url, todo_list, todo_add, todo_toggle, todo_del, music_open,
+            lunar_now, music_set
         ])
         .build(tauri::generate_context!())
         .expect("NestDesk 启动失败");

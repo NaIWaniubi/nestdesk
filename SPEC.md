@@ -88,7 +88,8 @@
   M2 journal（JSONL，undo_last/undo_all，missing/conflict 报告）、内置 12 断言 selftest。
   代码 nestdesk-app/；spike 结论已固化进 layer.rs。
 - ✅ v0.3（2026-11-24）：融合开源能力——控制台五标签（桌面勾选收取/归纳+✨智能推荐方案+organize 兼容 YAML 导入导出/事务批次勾选回滚/Czkawka 式 SHA-256 查重→_重复待清理过 journal 可复原/透明度+皮肤）；selftest 16/16。
-- ⏳ 待办：托盘+全局快捷键、开机自启、规则增强（年龄/大小条件）、天气/倒计时组件、管理员窗口拖放兜底 UI。
+- ✅ v0.4（2026-11-24）：双参照融合（vendor/folia AGPL、vendor/deskbox GPL，均只借范式不抄码）——S-A copy-verify 跨卷、S-B 链接拖放下载、S-C 农历时钟（.NET 日历实测正确：2026-11-24=农历十月十六·马年）、S-D 待办组件、S-E Folia 进程托管入口；selftest 16/16、demo 355/355 回归通过；详见 FUSION-PLAN.md。
+- ⏳ 待办：托盘+全局快捷键、开机自启、年龄/大小规则、天气倒计时、剪贴板历史。
 
 ## 6. 非目标（MVP 明确不做）
 Dock/桌面栏、完整音乐播放器（仅留 now-playing 数据接口给 music 组件）、规则 YAML 编辑器、多用户同步、macOS/Linux。

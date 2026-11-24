@@ -46,7 +46,7 @@
       "ok": true
     },
     {
-      "info": "[\"C:\\\\Users\\\\chen\\\\AppData\\\\Local\\\\Temp\\\\nestdesk-selftest-1795489001424\\\\Nest\\\\收件箱\\\\文档\\\\报告 0.docx\"]",
+      "info": "[\"C:\\\\Users\\\\chen\\\\AppData\\\\Local\\\\Temp\\\\nestdesk-selftest-1795491821434\\\\Nest\\\\收件箱\\\\文档\\\\报告 0.docx\"]",
       "name": "复原: 被删文件计入 missing",
       "ok": true
     },
@@ -71,7 +71,7 @@
       "ok": true
     },
     {
-      "info": "target=1795489003126-6 UndoReport { restored: 1, renamed: 0, missing: [], batches_left: 1 }",
+      "info": "target=1795491822639-6 UndoReport { restored: 1, renamed: 0, missing: [], batches_left: 1 }",
       "name": "勾选复原: 仅回滚指定批次，其余保留",
       "ok": true
     },
@@ -82,5 +82,5 @@
     }
   ],
   "pass": true,
-  "root": "C:\\Users\\chen\\AppData\\Local\\Temp\\nestdesk-selftest-1795489001424"
+  "root": "C:\\Users\\chen\\AppData\\Local\\Temp\\nestdesk-selftest-1795491821434"
 }

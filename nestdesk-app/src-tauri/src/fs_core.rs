@@ -91,49 +91,134 @@ pub fn unique_dest(dir: &Path, name: &str) -> PathBuf {
     cand
 }
 
-fn move_any(src: &Path, dst: &Path) -> std::io::Result<()> {
-    if let Some(p) = dst.parent() {
-        fs::create_dir_all(p)?;
-    }
-    match fs::rename(src, dst) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            // 跨卷等：复制后删除
-            copy_tree(src, dst)?;
-            let _ = if src.is_dir() { fs::remove_dir_all(src) } else { fs::remove_file(src) };
-            Ok(())
+fn sha256_of(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 1 << 16];
+    loop {
+        match std::io::Read::read(&mut file, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(_) => return None,
         }
     }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+/// cross-volume transport: copy then SHA-256 verify then delete source (DeskBox pattern); same-volume stays atomic rename.
+fn move_any(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if let Some(p) = dst.parent() {
+        std::fs::create_dir_all(p)?;
+    }
+    if std::fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+    let src_hash = sha256_of(src);
+    if copy_tree(src, dst).is_err() {
+        return Err(std::io::Error::other("copy failed"));
+    }
+    if let Some(ref want) = src_hash {
+        if sha256_of(dst).as_deref() != Some(want.as_str()) {
+            let _ = std::fs::remove_file(dst);
+            return Err(std::io::Error::other("verify failed: hash mismatch, source kept"));
+        }
+    }
+    let _ = if src.is_dir() { std::fs::remove_dir_all(src) } else { std::fs::remove_file(src) };
+    Ok(())
 }
 
 fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
     if src.is_dir() {
-        fs::create_dir_all(dst)?;
-        for e in fs::read_dir(src)? {
+        std::fs::create_dir_all(dst)?;
+        for e in std::fs::read_dir(src)? {
             let e = e?;
             copy_tree(&e.path(), &dst.join(e.file_name()))?;
         }
     } else {
-        fs::copy(src, dst)?;
+        std::fs::copy(src, dst)?;
     }
     Ok(())
 }
 
 pub fn read_entries(cfg: &Config) -> Vec<Entry> {
-    let Ok(data) = fs::read_to_string(&cfg.journal) else { return Vec::new() };
+    let Ok(data) = std::fs::read_to_string(&cfg.journal) else { return Vec::new(); };
     data.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
 }
 
 fn append_entries(cfg: &Config, entries: &[Entry]) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(p) = cfg.journal.parent() {
-        fs::create_dir_all(p)?;
+        std::fs::create_dir_all(p)?;
     }
-    let mut f = fs::OpenOptions::new().create(true).append(true).open(&cfg.journal)?;
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&cfg.journal)?;
     for e in entries {
         writeln!(f, "{}", serde_json::to_string(e).unwrap())?;
     }
     Ok(())
+}
+
+/// S-B: http(s) download-to-grid (DeskBox multi-source drop), passes journal, 100MB guard.
+pub fn save_url(cfg: &Config, groups: &[(String, Vec<String>)], url: &str) -> IngestResult {
+    let batch = format!("{}-url", now_ms());
+    let mut moved = Vec::new();
+    let mut failed = Vec::new();
+    let mut entries = Vec::new();
+    let lower = url.to_ascii_lowercase();
+    let is_http = lower.starts_with("http://") || lower.starts_with("https://");
+    if !is_http {
+        failed.push(Failed { path: url.to_string(), reason: String::from("not an http(s) link") });
+        return IngestResult { batch, moved, failed };
+    }
+    let clean: String = url.split('?').next().unwrap_or(url)
+        .split('/').filter(|x| !x.is_empty()).last().unwrap_or("download")
+        .chars().filter(|c| !matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*')).collect();
+    let name = if clean.is_empty() || !clean.contains('.') { format!("download-{}.bin", now_ms() % 100000) } else { clean };
+    let group = group_resolve(&PathBuf::from(&name), groups);
+    let dest = unique_dest(&cfg.inbox_root.join(&group), &name);
+    let tmp = dest.with_extension("part");
+    // 参数走 stdin 而非命令行拼接，规避全部引号转义问题
+    let script = "$ProgressPreference='SilentlyContinue'; $u=[Console]::In.ReadLine(); $p=[Console]::In.ReadLine(); try { Invoke-WebRequest -Uri $u -OutFile $p -UseBasicParsing } catch { exit 3 }";
+    let mut child = match std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                failed.push(Failed { path: url.to_string(), reason: format!("spawn failed: {e}") });
+                return IngestResult { batch, moved, failed };
+            }
+        };
+    {
+        use std::io::Write;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = writeln!(stdin, "{}", url);
+            let _ = writeln!(stdin, "{}", tmp.to_string_lossy());
+        }
+    }
+    let ok_download = matches!(child.wait(), Ok(s) if s.success());
+    if !ok_download {
+        failed.push(Failed { path: url.to_string(), reason: String::from("download failed") });
+        let _ = std::fs::remove_file(&tmp);
+        return IngestResult { batch, moved, failed };
+    }
+    if let Ok(meta) = std::fs::metadata(&tmp) {
+        if meta.len() > 100 * 1024 * 1024 {
+            let _ = std::fs::remove_file(&tmp);
+            failed.push(Failed { path: url.to_string(), reason: String::from("over 100MB, skipped") });
+            return IngestResult { batch, moved, failed };
+        }
+    }
+    if std::fs::rename(&tmp, &dest).is_err() {
+        let _ = std::fs::rename(&tmp, &dest);
+    }
+    let new = dest.to_string_lossy().to_string();
+    entries.push(Entry { batch: batch.clone(), old: url.to_string(), new: new.clone(), ts: now_ms() });
+    moved.push(Moved { old: url.to_string(), new, group });
+    let _ = append_entries(cfg, &entries);
+    IngestResult { batch, moved, failed }
 }
 
 pub fn ingest(cfg: &Config, paths: Vec<String>) -> IngestResult {

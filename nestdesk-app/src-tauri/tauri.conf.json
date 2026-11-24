@@ -68,6 +68,20 @@
         "focus": false
       },
       {
+        "label": "todo",
+        "title": "归巢 · 待办",
+        "width": 260,
+        "height": 300,
+        "x": 1180,
+        "y": 40,
+        "transparent": true,
+        "decorations": false,
+        "skipTaskbar": true,
+        "resizable": false,
+        "shadow": false,
+        "focus": false
+      },
+      {
         "label": "settings",
         "title": "归巢 · 控制台",
         "width": 660,
