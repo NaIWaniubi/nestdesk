@@ -247,103 +247,236 @@ const ALPHA_KEYS = [
   ["shelf", "收纳框"], ["clock", "时钟"], ["sysmon", "系统监视"], ["note", "便利贴"],
 ] as const;
 
+interface SuggestPlanT {
+  stats: { ext: string; count: number }[];
+  suggested: { name: string; exts: string[] }[];
+  reason: string;
+}
+interface GroupRule { name: string; exts: string[] }
+interface AppSettings { groups: GroupRule[]; alpha: Record<string, number> }
+
 function Settings() {
+  type Tab = "桌面" | "归纳" | "事务" | "查重" | "更多";
+  const [tab, setTab] = useState<Tab>("桌面");
   const [groups, setGroups] = useState<GroupRule[]>([]);
   const [alpha, setAlpha] = useState<Record<string, number>>({});
   const [saved, setSaved] = useState("");
+  const [msg, setMsg] = useState("");
 
-  useEffect(() => {
-    invoke<AppSettings>("settings_get").then((s) => {
-      setGroups(s.groups);
-      setAlpha(s.alpha);
-    });
-  }, []);
-
-  const updateExts = (i: number, raw: string) => {
-    const exts = raw.split(/[,，\s]+/).map((e) => e.trim().toLowerCase()).filter(Boolean);
-    setGroups((gs) => gs.map((g, j) => (j === i ? { ...g, exts } : g)));
+  // ---- 桌面勾选 ----
+  interface DeskItemT { path: string; name: string; size: number; is_dir: boolean; group: string }
+  const [desk, setDesk] = useState<DeskItemT[]>([]);
+  const [pick, setPick] = useState<Record<number, boolean>>({});
+  const loadDesk = () => invoke<DeskItemT[]>("shelf_desk_items").then(setDesk).catch(() => {});
+  useEffect(() => { loadDesk(); }, []);
+  const collectPicked = async () => {
+    const paths = desk.filter((_, i) => pick[i]).map((d) => d.path);
+    if (!paths.length) { setMsg("勾选至少一个"); return; }
+    const r = await invoke<IngestResult>("shelf_ingest", { paths });
+    setSaved(`已归档 ${r.moved.length} 个${r.failed.length ? `，${r.failed.length} 个失败` : ""}`);
+    setPick({}); loadDesk();
   };
-  const addGroup = () => setGroups((gs) => [...gs, { name: "", exts: [] }]);
-  const removeGroup = (i: number) =>
-    setGroups((gs) => (gs.length <= 1 ? gs : gs.filter((_, j) => j !== i)));
+
+  // ---- 智能推荐 / YAML ----
+  interface SuggestT { name: string; exts: string[] }
+  const [sugg, setSugg] = useState<SuggestT[]>([]);
+  const suggest = async () => {
+    const p = await invoke<SuggestPlanT>("plan_suggest");
+    setMsg(p.reason || "");
+    setSugg(p.suggested);
+  };
+  const applySugg = async () => {
+    const merged = [...groups];
+    for (const s of sugg) if (!merged.some((g) => g.name === s.name)) merged.push({ name: s.name, exts: s.exts });
+    await invoke("settings_save", { groups: merged, alpha });
+    setGroups(merged); setSugg([]); setSaved(`应用推荐：${sugg.length} 个新归纳文件夹`);
+  };
+  const doYamlExport = async () => { const t = await invoke<string>("yaml_export"); downloadText("nestdesk-groups.yaml", t); setMsg("已导出 yaml"); };
+  const doYamlImport = async () => {
+    const f = prompt("粘贴 organize/NestDesk 兼容的 yml 规则文本："); if (!f) return;
+    const ns = await invoke<AppSettings>("yaml_import", { text: f });
+    setGroups(ns.groups); setAlpha(ns.alpha); setSaved(`导入 ${ns.groups.length} 个归纳文件夹`);
+  };
+
+  // ---- 事务批次 ----
+  interface BatchT { batch: string; ts: number; count: number; groups: [string, number][] }
+  const [batches, setBatches] = useState<BatchT[]>([]);
+  const [bpick, setBPick] = useState<Record<number, boolean>>({});
+  const loadB = () => invoke<BatchT[]>("shelf_batches").then(setBatches).catch(() => {});
+  useEffect(() => { loadB(); }, []);
+  const undoSel = async () => {
+    const sel = batches.filter((_, i) => bpick[i]).map((b) => b.batch);
+    if (!sel.length) { setMsg("勾选至少一批"); return; }
+    const r = await invoke<UndoReport>("shelf_undo_selected", { batches: sel });
+    setSaved(`复原 ${r.restored}${r.renamed ? `（${r.renamed} 挪旁）` : ""}${r.missing.length ? `，${r.missing.length} 缺失` : ""}`);
+    setBPick({}); loadB(); loadDesk();
+  };
+
+  // ---- 查重 ----
+  interface DupT { sha: string; size: number; count: number; paths: string[]; wasted: number }
+  const [dups, setDups] = useState<DupT[]>([]);
+  const [keepNew, setKeepNew] = useState(true);
+  const [dsha, setDSha] = useState<Record<number, boolean>>({});
+  const scanDups = async () => {
+    try { const res = await invoke<DupT[]>("dup_scan"); setDups(res); setMsg(`扫描完成：${res.length} 组重复，可省 ${fmtBytes(res.reduce((a, b) => a + b.wasted, 0))}`); }
+    catch { setMsg("扫描失败（收件箱可能不存在，先收取桌面再扫）"); }
+  };
+  const archDups = async () => {
+    const shas = dups.filter((_, i) => dsha[i]).map((d) => d.sha);
+    if (!shas.length) { setMsg("勾选至少一组"); return; }
+    const r = await invoke<IngestResult>("dup_archive", { shas, keepNewest: keepNew });
+    setSaved(`归档重复 ${r.moved.length} 个 → _重复待清理${r.failed.length ? `，失败 ${r.failed.length}` : ""}（可一键复原）`);
+    setDSha({}); scanDups(); loadDesk();
+  };
+
+  useEffect(() => { invoke<AppSettings>("settings_get").then((s) => { setGroups(s.groups); setAlpha(s.alpha); }); }, []);
 
   const save = async () => {
-    // 校验：空名行跳过；至少要有一格
     const clean = groups.map((g) => ({ ...g, name: g.name.trim() })).filter((g) => g.name);
-    if (clean.length === 0) {
-      setSaved("至少要保留一个归纳文件夹");
-      return;
-    }
-    if (!clean.some((g) => g.name === "其他")) {
-      clean.push({ name: "其他", exts: [] }); // 兜底格，保证未匹配文件有归宿
-    }
-    await invoke("settings_save", { groups: clean, alpha });
-    setGroups(clean);
-    setSaved(`✓ 已保存：${clean.length} 个归纳文件夹，透明度即时生效`);
+    if (!clean.length) { setSaved("至少要保留一个归纳文件夹"); return; }
+    if (!clean.some((g) => g.name === "其他")) clean.push({ name: "其他", exts: [] });
+    await invoke("settings_save", { groups: clean, alpha }); setGroups(clean); setSaved(`✓ 已保存：${clean.length} 个归纳文件夹`);
   };
 
+  const tabs: { k: Tab; label: string }[] = [
+    { k: "桌面", label: "桌面" }, { k: "归纳", label: "归纳" }, { k: "事务", label: "事务" },
+    { k: "查重", label: "查重" }, { k: "更多", label: "更多" },
+  ];
+  const updateExts = (i: number, raw: string) => setGroups((gs) => gs.map((g, j) => (j === i ? { ...g, exts: raw.split(/[,，\s]+/).map((e) => e.trim().toLowerCase()).filter(Boolean) } : g)));
+
   return (
-    <div className="card" style={{ overflow: "auto" }}>
-      <div className="head"><b>🏠 归巢 · 控制台</b><span className="sp" /></div>
-
-      <div style={{ padding: "4px 14px 8px", fontSize: 12, color: "var(--dim)" }}>
-            归纳文件夹 = 文件归档的分类格。扩展名空格或逗号分隔；「其他」是未匹配文件的兜底格（自动追加、不可删）。
-          </div>
-      <div style={{ padding: "0 14px 10px" }}>
-        {groups.map((g, i) => (
-          <div key={i} style={{ display: "flex", gap: 6, marginBottom: 6, alignItems: "center" }}>
-            <input className="nodrag"
-              style={{ flex: 1, background: "var(--bar-bg)", border: "1px solid var(--border)",
-                color: "var(--text)", borderRadius: 8, padding: "6px 9px", fontSize: 12, outline: "none" }}
-              value={g.name}
-              onChange={(e) => setGroups((gs) => gs.map((h, j) => (j === i ? { ...h, name: e.target.value } : h)))}
-              placeholder="文件夹名，如「论文」" />
-            <input className="nodrag"
-              style={{ flex: 2, background: "var(--bar-bg)", border: "1px solid var(--border)",
-                color: "var(--text)", borderRadius: 8, padding: "6px 9px", fontSize: 12, outline: "none" }}
-              value={g.exts.join(" ")}
-              onChange={(e) => updateExts(i, e.target.value)}
-              placeholder="扩展名，如 pdf doc png" />
-            <span className="btn nodrag" onClick={() => removeGroup(i)}>✕</span>
-          </div>
-        ))}
-        <span className="btn nodrag" onClick={addGroup}>＋ 添加归纳文件夹</span>
-      </div>
-
-      <div style={{ padding: "0 14px 8px", fontSize: 12, color: "var(--dim)" }}>面板透明度（实时生效）</div>
-      <div style={{ padding: "0 14px 10px" }}>
-        {ALPHA_KEYS.map(([k, label]) => (
-          <div key={k} className="mon-row" style={{ marginBottom: 4 }}>
-            <div className="lbl"><span>{label}</span><span>{Math.round((alpha[k] ?? 250) / 255 * 100)}%</span></div>
-            <input type="range" min={30} max={255}
-              style={{ width: "100%", accentColor: "var(--accent)" }}
-              value={alpha[k] ?? 250}
-              onChange={(e) => setAlpha((a) => ({ ...a, [k]: Number(e.target.value) }))} />
-          </div>
+    <div className="card" style={{ overflow: "hidden", display: "flex", flexDirection: "column", height: "100vh" }}>
+      <div style={{ display: "flex", borderBottom: "1px solid var(--border)", background: "var(--bar-bg)" }}>
+        {tabs.map((t) => (
+          <span key={t.k} onClick={() => setTab(t.k)} style={{
+            padding: "9px 14px", fontSize: 12, cursor: "pointer",
+            color: tab === t.k ? "var(--accent)" : "var(--dim)",
+            borderBottom: tab === t.k ? "2px solid var(--accent)" : "2px solid transparent",
+          }}>{t.label}</span>
         ))}
       </div>
 
-      <div style={{ padding: "0 14px 8px", fontSize: 12, color: "var(--dim)" }}>皮肤</div>
-      <div style={{ padding: "0 14px 12px", display: "flex", gap: 8 }}>
-        {(["night", "sunset", "contrast", "mist"] as const).map((t) => (
-          <span key={t} className="btn nodrag"
-            onClick={() => {
-              document.documentElement.dataset.theme = t;
-              invoke("theme_set", { theme: t });
-              setSaved(`皮肤：${({ night: "夜航", sunset: "落日晚霞", contrast: "高对比", mist: "雨雾" } as Record<string, string>)[t]}（即时生效）`);
-            }}>
-            {({ night: "夜航", sunset: "落日晚霞", contrast: "高对比", mist: "雨雾" } as Record<string, string>)[t]}
-          </span>
-        ))}
+      <div style={{ flex: 1, overflowY: "auto", padding: "12px 14px" }}>
+        {tab === "桌面" && (
+          <>
+            <div style={{ fontSize: 12, color: "var(--dim)", marginBottom: 6 }}>勾选要收取进归纳体系的文件（按系统推荐归类）：</div>
+            {desk.length === 0 && <div style={{ fontSize: 11, color: "var(--dim)" }}>载入中…或桌面暂无文件</div>}
+            {desk.slice(0, 120).map((d, i) => (
+              <label key={d.path} style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 11, padding: "3px 0" }}>
+                <input type="checkbox" checked={!!pick[i]} onChange={(e) => setPick((p) => ({ ...p, [i]: e.target.checked }))} />
+                <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{d.name}{d.is_dir ? "/" : ""}</span>
+                <span style={{ color: "var(--dim)" }}>{fmtBytes(d.size)}</span>
+                <span style={{ color: "var(--accent)", minWidth: 56, textAlign: "right" }}>{d.group}</span>
+              </label>
+            ))}
+            <div style={{ marginTop: 10 }}><span className="btn nodrag" onClick={collectPicked}>⬇ 收取勾选的 {Object.values(pick).filter(Boolean).length} 个</span></div>
+          </>
+        )}
+
+        {tab === "归纳" && (
+          <>
+            {groups.map((g, i) => (
+              <div key={i} style={{ display: "flex", gap: 6, marginBottom: 6, alignItems: "center" }}>
+                <input style={{ flex: 1, background: "var(--bar-bg)", border: "1px solid var(--border)", color: "var(--text)", borderRadius: 8, padding: "6px 9px", fontSize: 12 }}
+                  value={g.name} onChange={(e) => setGroups((gs) => gs.map((h, j) => (j === i ? { ...h, name: e.target.value } : h)))} placeholder="文件夹名" />
+                <input style={{ flex: 2, background: "var(--bar-bg)", border: "1px solid var(--border)", color: "var(--text)", borderRadius: 8, padding: "6px 9px", fontSize: 12 }}
+                  value={g.exts.join(" ")} onChange={(e) => updateExts(i, e.target.value)} placeholder="扩展名" />
+                <span className="btn nodrag" onClick={() => setGroups((gs) => (gs.length <= 1 ? gs : gs.filter((_, j) => j !== i)))}>✕</span>
+              </div>
+            ))}
+            <div style={{ marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <span className="btn nodrag" onClick={() => setGroups((gs) => [...gs, { name: "", exts: [] }])}>＋ 加格</span>
+              <span className="btn nodrag" onClick={suggest}>✨ 智能推荐方案</span>
+              <span className="btn nodrag" onClick={applySugg} style={sugg.length ? {} : { opacity: 0.5 }}>应用推荐 ({sugg.length})</span>
+              <span className="btn nodrag" onClick={doYamlExport}>导出 yml</span>
+              <span className="btn nodrag" onClick={doYamlImport}>导入 yml</span>
+              <span className="btn nodrag" onClick={save} style={{ padding: "6px 16px" }}>💾 保存归纳设置</span>
+            </div>
+            {sugg.length > 0 && (
+              <div style={{ marginTop: 8, fontSize: 11, color: "var(--dim)" }}>推荐新增：
+                {sugg.map((s, i) => <span key={i} style={{ display: "inline-block", margin: "2px 4px 2px 0", padding: "2px 8px", border: "1px solid var(--border)", borderRadius: 8 }}>{s.name} · {s.exts.join("/")}</span>)}
+              </div>
+            )}
+          </>
+        )}
+
+        {tab === "事务" && (
+          <>
+            <div style={{ fontSize: 12, color: "var(--dim)", marginBottom: 6 }}>事务日志按批记录，勾选要回滚的批次：</div>
+            {batches.length === 0 && <div style={{ fontSize: 11, color: "var(--dim)" }}>暂无事务记录</div>}
+            {batches.map((b, i) => (
+              <label key={b.batch} style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 11, padding: "4px 0" }}>
+                <input type="checkbox" checked={!!bpick[i]} onChange={(e) => setBPick((p) => ({ ...p, [i]: e.target.checked }))} />
+                <span style={{ flex: 1 }}>{new Date(b.ts).toLocaleString()} · {b.count} 个文件 · {b.groups.map((g) => `${g[0]}(${g[1]})`).join("、")}</span>
+                <span style={{ color: "var(--dim)" }}>{b.batch.slice(-6)}</span>
+              </label>
+            ))}
+            <div style={{ marginTop: 10, display: "flex", gap: 8 }}>
+              <span className="btn nodrag" onClick={undoSel}>↩ 复原勾选批次</span>
+              <span className="btn nodrag" onClick={loadB}>↻ 刷新</span>
+            </div>
+          </>
+        )}
+
+        {tab === "查重" && (
+          <>
+            <div style={{ display: "flex", gap: 8, marginBottom: 10, alignItems: "center" }}>
+              <span className="btn nodrag" onClick={scanDups}>🔍 扫描收件箱</span>
+              <label style={{ fontSize: 11 }}><input type="checkbox" checked={keepNew} onChange={(e) => setKeepNew(e.target.checked)} /> 每组保留最新版</label>
+            </div>
+            {dups.length === 0 && msg && <div style={{ fontSize: 11, color: "var(--dim)" }}>{msg}</div>}
+            {dups.map((d, i) => (
+              <div key={d.sha} style={{ marginBottom: 8, border: "1px solid var(--border)", borderRadius: 8, padding: "6px 8px" }}>
+                <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 11 }}>
+                  <input type="checkbox" defaultChecked onChange={(e) => setDSha((s) => ({ ...s, [i]: e.target.checked }))} />
+                  <span style={{ flex: 1 }}>{d.count}× {fmtBytes(d.size)} · 可省 {fmtBytes(d.wasted)} · {d.sha}</span>
+                </label>
+                <div style={{ fontSize: 10, color: "var(--dim)", marginTop: 3, paddingLeft: 22, whiteSpace: "pre-wrap" }}>{d.paths.join("\n")}</div>
+              </div>
+            ))}
+            {dups.length > 0 && <div style={{ marginTop: 6 }}><span className="btn warn nodrag" onClick={archDups}>🗑 归档勾选组的非最新版 → _重复待清理</span></div>}
+          </>
+        )}
+
+        {tab === "更多" && (
+          <>
+            <div style={{ fontSize: 12, color: "var(--dim)", margin: "4px 0 8px" }}>面板透明度（实时生效）</div>
+            {ALPHA_KEYS.map(([k, label]) => (
+              <div key={k} className="mon-row" style={{ marginBottom: 6 }}>
+                <div className="lbl"><span>{label}</span><span>{Math.round((alpha[k] ?? 250) / 255 * 100)}%</span></div>
+                <input type="range" min={30} max={255} style={{ width: "100%", accentColor: "var(--accent)" }}
+                  value={alpha[k] ?? 250} onChange={(e) => setAlpha((a) => ({ ...a, [k]: Number(e.target.value) }))} />
+              </div>
+            ))}
+            <div style={{ fontSize: 12, color: "var(--dim)", margin: "12px 0 8px" }}>皮肤</div>
+            <div style={{ display: "flex", gap: 8 }}>
+              {(["night", "sunset", "contrast", "mist"] as const).map((t) => (
+                <span key={t} className="btn nodrag" onClick={() => { document.documentElement.dataset.theme = t; invoke("theme_set", { theme: t }); setSaved(`皮肤：${({ night: "夜航", sunset: "落日晚霞", contrast: "高对比", mist: "雨雾" } as Record<string, string>)[t]}`); }}>
+                  {({ night: "夜航", sunset: "落日晚霞", contrast: "高对比", mist: "雨雾" } as Record<string, string>)[t]}
+                </span>
+              ))}
+            </div>
+            <div style={{ marginTop: 12, fontSize: 11, color: "var(--dim)" }}>透明度滑块改后点「💾 保存归纳设置」即写入并 ≤2 秒生效。</div>
+          </>
+        )}
       </div>
 
-      <div style={{ padding: "0 14px 16px" }}>
-        <span className="btn nodrag" onClick={save} style={{ padding: "8px 22px" }}>💾 保存设置</span>
+      <div className="foot">
+        <span style={{ color: saved ? "var(--accent)" : "var(--dim)" }}>{saved || msg || "设置随窗口位置自动记忆"}</span>
+        <span className="sp" style={{ flex: 1 }} />
+        <span className="badge nodrag" onClick={() => setTab(tab === "桌面" ? "归纳" : "桌面")} title="切换">⇄</span>
       </div>
-      <div className="toast">{saved || "设置会随窗口位置自动记忆"}</div>
     </div>
   );
 }
+
+function downloadText(name: string, text: string) {
+  const blob = new Blob([text], { type: "text/yaml" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a"); a.href = url; a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 
 export default function App() {
   const label = getCurrentWindow().label;

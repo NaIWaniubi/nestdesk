@@ -36,12 +36,17 @@
       "ok": true
     },
     {
+      "info": "paper=1 data=3",
+      "name": "自定分组: pdf→「论文」，其余落入表尾「数据集」兜底",
+      "ok": true
+    },
+    {
       "info": "miss=[\"报告 0.docx\"]",
       "name": "复原: 其余文件字节级归位",
       "ok": true
     },
     {
-      "info": "[\"C:\\\\Users\\\\chen\\\\AppData\\\\Local\\\\Temp\\\\nestdesk-selftest-1795456562846\\\\Nest\\\\收件箱\\\\文档\\\\报告 0.docx\"]",
+      "info": "[\"C:\\\\Users\\\\chen\\\\AppData\\\\Local\\\\Temp\\\\nestdesk-selftest-1795489001424\\\\Nest\\\\收件箱\\\\文档\\\\报告 0.docx\"]",
       "name": "复原: 被删文件计入 missing",
       "ok": true
     },
@@ -59,8 +64,23 @@
       "info": "UndoReport { restored: 1, renamed: 0, missing: [], batches_left: 1 }",
       "name": "粒度: undo_last 仅回滚末批",
       "ok": true
+    },
+    {
+      "info": "2 条建议",
+      "name": "智能推荐: 检测到 CAD图纸/字体 领域未覆盖",
+      "ok": true
+    },
+    {
+      "info": "target=1795489003126-6 UndoReport { restored: 1, renamed: 0, missing: [], batches_left: 1 }",
+      "name": "勾选复原: 仅回滚指定批次，其余保留",
+      "ok": true
+    },
+    {
+      "info": "sets=1 moved=2",
+      "name": "查重: 3份相同→组成 1 组·1 几何，归档可复原",
+      "ok": true
     }
   ],
   "pass": true,
-  "root": "C:\\Users\\chen\\AppData\\Local\\Temp\\nestdesk-selftest-1795456562846"
+  "root": "C:\\Users\\chen\\AppData\\Local\\Temp\\nestdesk-selftest-1795489001424"
 }

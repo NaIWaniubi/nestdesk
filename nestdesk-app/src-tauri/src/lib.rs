@@ -2,7 +2,7 @@
 mod fs_core;
 mod layer;
 
-use fs_core::{Config, IngestResult, Snapshot, UndoReport};
+use fs_core::{Config, DeskItem, DupSet, GroupRule2, IngestResult, Snapshot, SuggestPlan, UndoReport};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -179,6 +179,74 @@ fn theme_set(theme: String) {
     let _ = fs::write(data_dir().join("config.json"), format!("{{\"theme\":\"{theme}\"}}"));
 }
 
+// ---------- v0.3 控制台融合 commands ----------
+#[tauri::command]
+fn shelf_desk_items() -> Vec<DeskItem> {
+    init_settings();
+    let s = current_settings();
+    let groups: Vec<(String, Vec<String>)> = s.groups.iter().map(|g| (g.name.clone(), g.exts.clone())).collect();
+    fs_core::desk_items(&real_cfg(), &groups)
+}
+
+#[tauri::command]
+fn plan_suggest(threshold: Option<usize>) -> SuggestPlan {
+    init_settings();
+    fs_core::suggest_plan(&real_cfg(), threshold.unwrap_or(3))
+}
+
+#[tauri::command]
+fn yaml_export() -> String {
+    init_settings();
+    let s = current_settings();
+    let groups: Vec<(String, Vec<String>)> = s.groups.iter().map(|g| (g.name.clone(), g.exts.clone())).collect();
+    fs_core::export_yaml(&groups)
+}
+
+#[tauri::command]
+fn yaml_import(text: String) -> AppSettings {
+    if let Ok(groups) = fs_core::import_yaml(&text) {
+        if !groups.is_empty() {
+            let mut s = current_settings();
+            // merge: replace groups entirely with parsed ones + ensure 其他 fallback
+            s.groups = groups.into_iter().map(|(n, e)| GroupRule { name: n, exts: e }).collect();
+            if !s.groups.iter().any(|g| g.name == "其他") {
+                s.groups.push(GroupRule { name: "其他".into(), exts: vec![] });
+            }
+            if let Some(r) = SETTINGS.get() { *r.write().unwrap() = s.clone(); }
+            save_settings_file();
+            return s;
+        }
+    }
+    current_settings()
+}
+
+#[tauri::command]
+fn shelf_batches() -> Vec<fs_core::BatchInfo> {
+    fs_core::list_batches(&real_cfg())
+}
+
+#[tauri::command]
+fn shelf_undo_selected(batches: Vec<String>) -> UndoReport {
+    fs_core::undo_batches(&real_cfg(), batches)
+}
+
+#[tauri::command]
+fn dup_scan() -> Result<Vec<DupSet>, String> {
+    let cfg = real_cfg();
+    fs_core::find_dups(&cfg.inbox_root)
+}
+
+#[tauri::command]
+fn dup_archive(shas: Vec<String>, keep_newest: bool) -> IngestResult {
+    let cfg = real_cfg();
+    if shas.is_empty() {
+        return IngestResult { batch: String::new(), moved: vec![], failed: vec![] };
+    }
+    let all = fs_core::find_dups(&cfg.inbox_root).unwrap_or_default();
+    let sel: Vec<DupSet> = all.into_iter().filter(|d| shas.contains(&d.sha)).collect();
+    fs_core::archive_dups(&cfg, &sel, keep_newest)
+}
+
 // ---------- 布局持久化 + 桌面层钉扎 ----------
 #[derive(Serialize, serde::Deserialize, Clone, Copy, PartialEq)]
 struct Geom { x: i32, y: i32, w: u32, h: u32 }
@@ -248,7 +316,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             shelf_snapshot, shelf_ingest, shelf_collect_desktop, shelf_undo_last, shelf_undo_all,
             get_sysinfo, note_get, note_set, theme_get, theme_set,
-            settings_get, settings_save
+            settings_get, settings_save,
+            shelf_desk_items, plan_suggest, yaml_export, yaml_import,
+            shelf_batches, shelf_undo_selected, dup_scan, dup_archive
         ])
         .build(tauri::generate_context!())
         .expect("NestDesk 启动失败");
@@ -482,6 +552,45 @@ pub fn selftest() {
     fs_core::ingest(&cfg, vec![p2.to_string_lossy().to_string()]);
     let rep3 = fs_core::undo_last(&cfg);
     report("粒度: undo_last 仅回滚末批", rep3.restored == 1 && !p1.exists() && p2.exists() && fs_core::read_entries(&cfg).len() == 1, format!("{rep3:?}"));
+
+    // v0.3: 智能推荐
+    for i in 0..5 { fs::write(desktop.join(format!("dwg_{i}.dwg")), b"cad").unwrap(); }
+    for i in 0..4 { fs::write(desktop.join(format!("font_{i}.ttf")), b"font").unwrap(); }
+    let plan = fs_core::suggest_plan(&cfg, 3);
+    let has_cad = plan.suggested.iter().any(|g| g.name == "CAD图纸" && g.exts.iter().any(|e| e == "dwg"));
+    let has_font = plan.suggested.iter().any(|g| g.name == "字体" && g.exts.iter().any(|e| e == "ttf"));
+    report("智能推荐: 检测到 CAD图纸/字体 领域未覆盖", has_cad && has_font, format!("{} 条建议", plan.suggested.len()));
+
+    // v0.3: 事务批次勾选复原（独立子沙箱，避免前后步楠屾薄染）
+    let sub = root.join("selbox"); let subd = sub.join("Desktop"); let subi = sub.join("Nest").join("收件箱");
+    let _ = fs::create_dir_all(&subd); let _ = fs::create_dir_all(&subi);
+    let cfg2 = Config { desktop: subd.clone(), inbox_root: subi.clone(), journal: sub.join("journal.jsonl"), groups: None };
+    let sa = sub.join("paperX-aaa.pdf"); fs::write(&sa, b"A").unwrap();
+    let sb = sub.join("paperX-bbb.pdf"); fs::write(&sb, b"B").unwrap();
+    fs_core::ingest(&cfg2, vec![sa.to_string_lossy().to_string()]);
+    fs_core::ingest(&cfg2, vec![sb.to_string_lossy().to_string()]);
+    let bl = fs_core::list_batches(&cfg2);
+    assert_eq!(bl.len(), 2);
+    let target_batch = bl.last().unwrap().batch.clone(); // oldest
+    let rep_sel = fs_core::undo_batches(&cfg2, vec![target_batch]);
+    let sel_ok = rep_sel.restored == 1 && sa.exists() && !sb.exists() && fs_core::list_batches(&cfg2).len() == 1;
+    report("勾选复原: 仅回滚指定批次，其余保留", sel_ok, format!("target={} {:?}", bl.last().unwrap().batch, rep_sel));
+
+    // v0.3: 查重模块（Czkawka 思路）
+    let dc = cfg2.inbox_root.join("文档"); let _ = fs::create_dir_all(&dc);
+    for i in 0..3 { fs::write(dc.join(format!("same_{}.pdf", i)), b"DUPLICATE-CONTENT").unwrap(); }
+    fs::write(dc.join("uniq.pdf"), b"UNIQUE").unwrap();
+    let cl = b"DUPLICATE-CONTENT".len() as u64;
+    let sets = fs_core::find_dups(&cfg2.inbox_root).unwrap();
+    let ds = sets.iter().find(|d| d.count == 3 && d.size == cl).expect("dup set");
+    let mov = fs_core::archive_dups(&cfg2, std::slice::from_ref(ds), true);
+    let moved_back_ok = {
+        // undo the dup batch → originals return
+        let r = fs_core::undo_all(&cfg2);
+        (dc.join("same_0.pdf")).exists() && r.restored >= 1
+    };
+    report("查重: 3份相同→组成 1 组·1 几何，归档可复原", sets.len() == 1 && mov.moved.len() == 2 && moved_back_ok,
+        format!("sets={} moved={}", sets.len(), mov.moved.len()));
 
     let pass = checks.iter().all(|c| c["ok"].as_bool().unwrap_or(false));
     println!("{}", serde_json::to_string_pretty(&serde_json::json!({"pass": pass, "checks": checks, "root": root})).unwrap());
