@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-lunar-now"
+description = "Enables the lunar_now command without any pre-configured scope."
+commands.allow = ["lunar_now"]
+
+[[permission]]
+identifier = "deny-lunar-now"
+description = "Denies the lunar_now command without any pre-configured scope."
+commands.deny = ["lunar_now"]

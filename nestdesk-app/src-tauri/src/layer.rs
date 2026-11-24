@@ -1,5 +1,4 @@
 // layer.rs — Win32 桌面层与系统信息原语（零第三方依赖，S0 spike 实测结论的正式化）
-#![allow(dead_code)]
 use std::ffi::c_void;
 use std::sync::Mutex;
 
@@ -8,10 +7,11 @@ pub type HWND = *mut c_void;
 const SWP_NOSIZE: u32 = 0x0001;
 const SWP_NOMOVE: u32 = 0x0002;
 const SWP_NOACTIVATE: u32 = 0x0010;
-const SW_RESTORE: i32 = 9;
+const SW_SHOWNOACTIVATE: i32 = 4; // 恢复最小化但不激活（SW_RESTORE=9 会抢焦点）
 
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
+#[allow(dead_code)] // FFI 结构体：字段必须完整布局，部分字段不参与计算
 pub struct MemoryStatusEx {
     pub dw_length: u32,
     pub dw_memory_load: u32,
@@ -48,6 +48,7 @@ impl FileTimeT {
 #[link(name = "user32")]
 unsafe extern "system" {
     fn SetWindowPos(hwnd: HWND, after: HWND, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
+    fn GetWindow(hwnd: HWND, cmd: u32) -> HWND;
     fn IsWindow(hwnd: HWND) -> i32;
     fn IsIconic(hwnd: HWND) -> i32;
     fn ShowWindow(hwnd: HWND, cmd: i32) -> i32;
@@ -71,21 +72,25 @@ unsafe extern "system" {
 /// 按控制台设置实时刷新窗口不透明度（30..=255）。只改 LWA_ALPHA，
 /// 不碰扩展样式——扩展样式的反复改写会把窗口踢出桌面合成（实测教训）。
 pub unsafe fn set_alpha(h: HWND, alpha: u8) {
-    if h.is_null() || IsWindow(h) == 0 {
-        return;
+    unsafe {
+        if h.is_null() || IsWindow(h) == 0 {
+            return;
+        }
+        let a = alpha.clamp(30, 255);
+        SetLayeredWindowAttributes(h, 0, a, 0x2 /* LWA_ALPHA */);
     }
-    let a = alpha.clamp(30, 255);
-    SetLayeredWindowAttributes(h, 0, a, 0x2 /* LWA_ALPHA */);
 }
 
 /// Win11 DWM 圆角。注意：ACRYLIC backdrop 与 WS_EX_LAYERED+LWA_ALPHA 互斥，
 /// 曾导致窗口整体不进桌面合成（A/B 实测），故只设圆角、不设 backdrop。
 pub unsafe fn style_surface(h: HWND) {
-    if h.is_null() {
-        return;
+    unsafe {
+        if h.is_null() {
+            return;
+        }
+        let corner: u32 = 2; // DWMWCP_ROUND
+        DwmSetWindowAttribute(h, 33, &corner, 4);
     }
-    let corner: u32 = 2; // DWMWCP_ROUND
-    DwmSetWindowAttribute(h, 33, &corner, 4);
 }
 
 /// 窗口扩展样式定型（仅应每窗执行一次；反复改写会破坏桌面合成，实测教训）。
@@ -93,27 +98,40 @@ pub unsafe fn style_surface(h: HWND) {
 /// 不参与桌面合成（A/B 实测）。去掉它并补 WS_EX_LAYERED+LWA_ALPHA：
 /// 走分层合成路径，既保留 CSS 半透明，也能沉到桌面层。
 pub unsafe fn ensure_layered(h: HWND) {
-    if h.is_null() || IsWindow(h) == 0 {
-        return;
-    }
-    const EX_LAYERED: isize = 0x0008_0000;
-    const EX_NO_REDIR: isize = 0x0004_0000;
-    let ex = GetWindowLongPtrW(h, -20);
-    if (ex & EX_NO_REDIR) != 0 || (ex & EX_LAYERED) == 0 {
-        SetWindowLongPtrW(h, -20, (ex & !EX_NO_REDIR) | EX_LAYERED);
-        SetLayeredWindowAttributes(h, 0, 254, 0x2 /* LWA_ALPHA */);
+    unsafe {
+        if h.is_null() || IsWindow(h) == 0 {
+            return;
+        }
+        const EX_LAYERED: isize = 0x0008_0000;
+        const EX_NO_REDIR: isize = 0x0004_0000;
+        let ex = GetWindowLongPtrW(h, -20);
+        if (ex & EX_NO_REDIR) != 0 || (ex & EX_LAYERED) == 0 {
+            SetWindowLongPtrW(h, -20, (ex & !EX_NO_REDIR) | EX_LAYERED);
+            SetLayeredWindowAttributes(h, 0, 254, 0x2 /* LWA_ALPHA */);
+        }
     }
 }
 
-/// 把窗口沉到桌面层，被 Win+D 最小化后自动恢复。不移动、不改大小、不抢焦点。
-pub unsafe fn pin_bottom(h: HWND) {
-    if h.is_null() || IsWindow(h) == 0 {
-        return;
+/// 安全包装：判断 HWND 是否仍存活（用于清理 STYLED 死条目）。
+pub fn is_window(h: HWND) -> bool {
+    unsafe { !h.is_null() && IsWindow(h) != 0 }
+}
+
+/// 只在真的需要时重钉：被 Win+D 最小化，或已经不在最底。Z 序稳定时零系统调用代价。
+pub unsafe fn repin_if_needed(h: HWND) {
+    unsafe {
+        if h.is_null() || IsWindow(h) == 0 {
+            return;
+        }
+        if IsIconic(h) != 0 {
+            ShowWindow(h, SW_SHOWNOACTIVATE);
+            SetWindowPos(h, 1 as HWND, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            return;
+        }
+        if GetWindow(h, 1 /* GW_HWNDLAST */) != h {
+            SetWindowPos(h, 1 as HWND, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
     }
-    if IsIconic(h) != 0 {
-        ShowWindow(h, SW_RESTORE);
-    }
-    SetWindowPos(h, 1 as HWND, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
 static CPU_PREV: Mutex<Option<(u64, u64, u64)>> = Mutex::new(None);
@@ -128,7 +146,7 @@ pub fn cpu_usage() -> f64 {
             return -1.0;
         }
         let (i, k, u) = (idle.u64(), kern.u64(), user.u64());
-        let mut g = CPU_PREV.lock().unwrap();
+        let mut g = CPU_PREV.lock().unwrap_or_else(|e| e.into_inner());
         let r = match *g {
             Some((pi, pk, pu)) => {
                 let di = i.saturating_sub(pi);

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "panel-sysmon",
+  "description": "系统监视：CPU/内存/电池/皮肤",
+  "windows": ["sysmon"],
+  "permissions": ["core:default", "allow-get-sysinfo", "allow-theme-get", "allow-theme-set"]
+}

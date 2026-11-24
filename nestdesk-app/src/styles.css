@@ -8,7 +8,7 @@
 [data-theme="night"] {   /* 夜航 */
   --bg: linear-gradient(160deg, rgba(15,20,40,.88), rgba(24,32,58,.82));
   --border: rgba(120,160,255,.22);
-  --text: #dce6ff; --dim: #7e91c0;
+  --text: #dce6ff; --dim: #8ea3d6;
   --accent: #6c8cff; --bar-bg: rgba(120,160,255,.16);
 }
 [data-theme="sunset"] {  /* 落日晚霞 */
@@ -26,7 +26,7 @@
 [data-theme="mist"] {    /* 雨雾 */
   --bg: linear-gradient(160deg, rgba(225,233,240,.88), rgba(198,211,224,.82));
   --border: rgba(70,90,110,.35);
-  --text: #1d2a38; --dim: #5d7082;
+  --text: #1d2a38; --dim: #4b5d6e;
   --accent: #2b6cb0; --bar-bg: rgba(70,90,110,.18);
 }
 
@@ -60,6 +60,9 @@ html, body, #root { background: transparent; margin: 0; height: 100%; }
 }
 .btn:hover { border-color: var(--accent); color: var(--accent); }
 .btn.warn:hover { border-color: #ff6b6b; color: #ff6b6b; }
+.btn:focus-visible, .badge:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
 
 .badge {
   -webkit-app-region: no-drag; cursor: pointer;
@@ -86,6 +89,7 @@ html, body, #root { background: transparent; margin: 0; height: 100%; }
   -webkit-app-region: no-drag; flex: 1; resize: none; outline: none;
   background: transparent; border: none; color: var(--text);
   font: 13px/1.6 "Microsoft YaHei UI", system-ui, sans-serif;
+  user-select: text; -webkit-user-select: text;
 }
 .note-saved { font-size: 10px; color: var(--dim); min-width: 46px; text-align: right; }
 
@@ -100,7 +104,7 @@ html, body, #root { background: transparent; margin: 0; height: 100%; }
   background: var(--bar-bg);
 }
 .group > summary .n { margin-left: auto; color: var(--dim); font-variant-numeric: tabular-nums; }
-.group .files { padding: 4px 12px 8px; font-size: 11px; color: var(--dim); line-height: 1.9; word-break: break-all; }
+.group .files { padding: 4px 12px 8px; font-size: 11px; color: var(--dim); line-height: 1.9; word-break: break-all; user-select: text; }
 .empty {
   margin: 18px 8px; padding: 26px 12px; text-align: center;
   border: 1.5px dashed var(--border); border-radius: 12px;

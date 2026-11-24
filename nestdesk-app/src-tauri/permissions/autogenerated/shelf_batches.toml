@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-shelf-batches"
+description = "Enables the shelf_batches command without any pre-configured scope."
+commands.allow = ["shelf_batches"]
+
+[[permission]]
+identifier = "deny-shelf-batches"
+description = "Denies the shelf_batches command without any pre-configured scope."
+commands.deny = ["shelf_batches"]

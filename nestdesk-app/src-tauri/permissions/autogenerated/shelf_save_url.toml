@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-shelf-save-url"
+description = "Enables the shelf_save_url command without any pre-configured scope."
+commands.allow = ["shelf_save_url"]
+
+[[permission]]
+identifier = "deny-shelf-save-url"
+description = "Denies the shelf_save_url command without any pre-configured scope."
+commands.deny = ["shelf_save_url"]

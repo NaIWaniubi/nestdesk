@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-shelf-desk-items"
+description = "Enables the shelf_desk_items command without any pre-configured scope."
+commands.allow = ["shelf_desk_items"]
+
+[[permission]]
+identifier = "deny-shelf-desk-items"
+description = "Denies the shelf_desk_items command without any pre-configured scope."
+commands.deny = ["shelf_desk_items"]

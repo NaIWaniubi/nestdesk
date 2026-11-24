@@ -81,17 +81,33 @@ fn split_name(name: &str) -> (String, String) {
 }
 
 pub fn unique_dest(dir: &Path, name: &str) -> PathBuf {
-    let (stem, ext) = split_name(name);
-    let mut cand = dir.join(name);
-    let mut i = 2;
-    while cand.exists() {
-        cand = dir.join(format!("{stem} ({i}){ext}"));
-        i += 1;
+    let (mut stem, ext) = split_name(name);
+    // Windows MAX_PATH 防呆：目录+扩展名之外给 stem 留的预算不足时截断
+    let budget = 250usize.saturating_sub(dir.to_string_lossy().chars().count() + ext.chars().count() + 10);
+    if budget >= 8 && stem.chars().count() > budget {
+        stem = stem.chars().take(budget).collect();
+    }
+    let mut cand = dir.join(format!("{stem}{ext}"));
+    if cand.exists() {
+        let mut i = 2u32;
+        loop {
+            if i <= 10_000 {
+                let c = dir.join(format!("{stem} ({i}){ext}"));
+                if !c.exists() { cand = c; break; }
+                i += 1;
+            } else {
+                // exists 异常（网络盘/链接回路）时不再无限循环，退化为时间戳后缀
+                let c = dir.join(format!("{stem}-{}{ext}", now_ms() % 100_000));
+                if !c.exists() { cand = c; break; }
+                cand = dir.join(format!("{stem}-{}-{}{ext}", now_ms() % 100_000, std::process::id()));
+                break;
+            }
+        }
     }
     cand
 }
 
-fn sha256_of(path: &Path) -> Option<String> {
+pub(crate) fn sha256_of(path: &Path) -> Option<String> {
     use sha2::{Digest, Sha256};
     let mut file = std::fs::File::open(path).ok()?;
     let mut hasher = Sha256::new();
@@ -107,6 +123,7 @@ fn sha256_of(path: &Path) -> Option<String> {
 }
 
 /// cross-volume transport: copy then SHA-256 verify then delete source (DeskBox pattern); same-volume stays atomic rename.
+/// 关键不变量：**哈希不可得即拒绝搬运**，绝不出现「未校验就删源」。
 fn move_any(src: &Path, dst: &Path) -> std::io::Result<()> {
     if let Some(p) = dst.parent() {
         std::fs::create_dir_all(p)?;
@@ -114,17 +131,62 @@ fn move_any(src: &Path, dst: &Path) -> std::io::Result<()> {
     if std::fs::rename(src, dst).is_ok() {
         return Ok(());
     }
-    let src_hash = sha256_of(src);
+    if src.is_dir() {
+        // 目录：先对整棵树取哈希快照，复制后逐文件比对
+        let mut want: Vec<(PathBuf, String)> = Vec::new();
+        hash_tree(src, src, &mut want)?;
+        if copy_tree(src, dst).is_err() {
+            let _ = std::fs::remove_dir_all(dst);
+            return Err(std::io::Error::other("copy failed"));
+        }
+        let mut got: Vec<(PathBuf, String)> = Vec::new();
+        if hash_tree(dst, dst, &mut got).is_err() {
+            let _ = std::fs::remove_dir_all(dst);
+            return Err(std::io::Error::other("verify failed: target unreadable, source kept"));
+        }
+        want.sort_by(|a, b| a.0.cmp(&b.0));
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        if want != got {
+            let _ = std::fs::remove_dir_all(dst);
+            return Err(std::io::Error::other("verify failed: tree hash mismatch, source kept"));
+        }
+        std::fs::remove_dir_all(src).map_err(|e| {
+            std::io::Error::other(format!("copy verified but source delete failed (both copies kept): {e}"))
+        })?;
+        return Ok(());
+    }
+    let want = sha256_of(src).ok_or_else(|| {
+        std::io::Error::other("sha256 failed: source unreadable, move aborted (source kept)")
+    })?;
     if copy_tree(src, dst).is_err() {
+        let _ = std::fs::remove_file(dst);
         return Err(std::io::Error::other("copy failed"));
     }
-    if let Some(ref want) = src_hash {
-        if sha256_of(dst).as_deref() != Some(want.as_str()) {
-            let _ = std::fs::remove_file(dst);
-            return Err(std::io::Error::other("verify failed: hash mismatch, source kept"));
+    if sha256_of(dst).as_deref() != Some(want.as_str()) {
+        let _ = std::fs::remove_file(dst);
+        return Err(std::io::Error::other("verify failed: hash mismatch, source kept"));
+    }
+    std::fs::remove_file(src).map_err(|e| {
+        std::io::Error::other(format!("copy verified but source delete failed (both copies kept): {e}"))
+    })?;
+    Ok(())
+}
+
+/// 递归收集 (相对路径, SHA-256)；任一文件不可哈希即整棵搬运失败。
+fn hash_tree(root: &Path, base: &Path, out: &mut Vec<(PathBuf, String)>) -> std::io::Result<()> {
+    for e in std::fs::read_dir(root)? {
+        let e = e?;
+        let p = e.path();
+        let rel = p.strip_prefix(base).unwrap_or(&p).to_path_buf();
+        if p.is_dir() {
+            hash_tree(&p, base, out)?;
+        } else {
+            let h = sha256_of(&p).ok_or_else(|| {
+                std::io::Error::other(format!("sha256 failed: {}", p.display()))
+            })?;
+            out.push((rel, h));
         }
     }
-    let _ = if src.is_dir() { std::fs::remove_dir_all(src) } else { std::fs::remove_file(src) };
     Ok(())
 }
 
@@ -141,12 +203,20 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+// journal 读-改-写与并发 append 的互斥锁：undo 期间禁止新条目插入，避免整体重写丢行
+static JOURNAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn journal_guard() -> std::sync::MutexGuard<'static, ()> {
+    JOURNAL_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub fn read_entries(cfg: &Config) -> Vec<Entry> {
     let Ok(data) = std::fs::read_to_string(&cfg.journal) else { return Vec::new(); };
     data.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
 }
 
 fn append_entries(cfg: &Config, entries: &[Entry]) -> std::io::Result<()> {
+    let _g = journal_guard();
     use std::io::Write;
     if let Some(p) = cfg.journal.parent() {
         std::fs::create_dir_all(p)?;
@@ -159,6 +229,7 @@ fn append_entries(cfg: &Config, entries: &[Entry]) -> std::io::Result<()> {
 }
 
 /// S-B: http(s) download-to-grid (DeskBox multi-source drop), passes journal, 100MB guard.
+/// 复原语义：下载没有「原本地路径」，journal 用 `@url|` 哨兵记录来源；undo 时删除落点 = 撤销下载。
 pub fn save_url(cfg: &Config, groups: &[(String, Vec<String>)], url: &str) -> IngestResult {
     let batch = format!("{}-url", now_ms());
     let mut moved = Vec::new();
@@ -175,7 +246,13 @@ pub fn save_url(cfg: &Config, groups: &[(String, Vec<String>)], url: &str) -> In
         .chars().filter(|c| !matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*')).collect();
     let name = if clean.is_empty() || !clean.contains('.') { format!("download-{}.bin", now_ms() % 100000) } else { clean };
     let group = group_resolve(&PathBuf::from(&name), groups);
-    let dest = unique_dest(&cfg.inbox_root.join(&group), &name);
+    let dest = unique_dest(&cfg.inbox_root.join(safe_group(&group)), &name);
+    if let Some(p) = dest.parent() {
+        if let Err(e) = std::fs::create_dir_all(p) {
+            failed.push(Failed { path: url.to_string(), reason: format!("cannot create target dir: {e}") });
+            return IngestResult { batch, moved, failed };
+        }
+    }
     let tmp = dest.with_extension("part");
     // 参数走 stdin 而非命令行拼接，规避全部引号转义问题
     let script = "$ProgressPreference='SilentlyContinue'; $u=[Console]::In.ReadLine(); $p=[Console]::In.ReadLine(); try { Invoke-WebRequest -Uri $u -OutFile $p -UseBasicParsing } catch { exit 3 }";
@@ -198,9 +275,30 @@ pub fn save_url(cfg: &Config, groups: &[(String, Vec<String>)], url: &str) -> In
             let _ = writeln!(stdin, "{}", tmp.to_string_lossy());
         }
     }
-    let ok_download = matches!(child.wait(), Ok(s) if s.success());
+    // 120s 硬超时：黑洞 URL 不允许永久占住 handler 线程
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break Some(s),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let ok_download = matches!(status, Some(s) if s.success());
     if !ok_download {
-        failed.push(Failed { path: url.to_string(), reason: String::from("download failed") });
+        let reason = if status.is_none() { "download timeout (120s), killed" } else { "download failed" };
+        failed.push(Failed { path: url.to_string(), reason: reason.into() });
         let _ = std::fs::remove_file(&tmp);
         return IngestResult { batch, moved, failed };
     }
@@ -211,13 +309,26 @@ pub fn save_url(cfg: &Config, groups: &[(String, Vec<String>)], url: &str) -> In
             return IngestResult { batch, moved, failed };
         }
     }
-    if std::fs::rename(&tmp, &dest).is_err() {
-        let _ = std::fs::rename(&tmp, &dest);
+    if let Err(e) = std::fs::rename(&tmp, &dest) {
+        let _ = std::fs::remove_file(&tmp);
+        failed.push(Failed { path: url.to_string(), reason: format!("move into inbox failed: {e}") });
+        return IngestResult { batch, moved, failed };
     }
     let new = dest.to_string_lossy().to_string();
-    entries.push(Entry { batch: batch.clone(), old: url.to_string(), new: new.clone(), ts: now_ms() });
+    entries.push(Entry {
+        batch: batch.clone(),
+        old: format!("@url|{url}"), // 哨兵：undo 时删除落点（撤销下载），而不是把文件搬到 URL
+        new: new.clone(),
+        ts: now_ms(),
+    });
+    if let Err(e) = append_entries(cfg, &entries) {
+        failed.push(Failed {
+            path: new,
+            reason: format!("downloaded but journal write failed (file kept, cannot undo): {e}"),
+        });
+        return IngestResult { batch, moved, failed };
+    }
     moved.push(Moved { old: url.to_string(), new, group });
-    let _ = append_entries(cfg, &entries);
     IngestResult { batch, moved, failed }
 }
 
@@ -243,7 +354,7 @@ pub fn ingest(cfg: &Config, paths: Vec<String>) -> IngestResult {
         }
         let groups = cfg.groups.clone().unwrap_or_else(default_groups);
         let g = group_resolve(&src, &groups);
-        let dest = unique_dest(&cfg.inbox_root.join(&g), &name);
+        let dest = unique_dest(&cfg.inbox_root.join(safe_group(&g)), &name);
         match move_any(&src, &dest) {
             Ok(()) => {
                 let new = dest.to_string_lossy().to_string();
@@ -278,11 +389,20 @@ fn undo_entries(cfg: &Config, sel: Vec<Entry>, total: Vec<Entry>) -> UndoReport 
     let sel_batches: HashSet<String> = sel.iter().map(|e| e.batch.clone()).collect();
     for e in sel.iter().rev() {
         let new_p = Path::new(&e.new);
-        let old_p = Path::new(&e.old);
         if !new_p.exists() {
             missing.push(e.new.clone());
             continue;
         }
+        // URL 下载条目：没有「原本地路径」，复原 = 撤销下载（删除落点）
+        if e.old.starts_with("@url|") {
+            let r = if new_p.is_dir() { std::fs::remove_dir_all(new_p) } else { std::fs::remove_file(new_p) };
+            match r {
+                Ok(()) => restored += 1,
+                Err(_) => missing.push(e.new.clone()),
+            }
+            continue;
+        }
+        let old_p = Path::new(&e.old);
         if old_p.exists() {
             // 原位置被占：挪到旁边并记冲突
             let dir = old_p.parent().unwrap_or(Path::new("."));
@@ -294,29 +414,41 @@ fn undo_entries(cfg: &Config, sel: Vec<Entry>, total: Vec<Entry>) -> UndoReport 
                 if !c.exists() { break c; }
                 i += 1;
             };
-            let _ = move_any(new_p, &cand);
-            renamed += 1;
-            restored += 1;
+            match move_any(new_p, &cand) {
+                Ok(()) => { renamed += 1; restored += 1; }
+                Err(_) => missing.push(e.new.clone()),
+            }
         } else if move_any(new_p, old_p).is_ok() {
             restored += 1;
         } else {
             missing.push(e.new.clone());
         }
     }
-    // 重写日志：去掉已回放的行
+    // 重写日志：去掉已回放的行（tmp → 备份旧日志 → 原子替换；失败回滚，绝不丢历史）
     let keep: Vec<Entry> = total.into_iter().filter(|e| !sel_batches.contains(&e.batch)).collect();
     if let Some(p) = cfg.journal.parent() {
         let _ = fs::create_dir_all(p);
     }
     let tmp = cfg.journal.with_extension("jsonl.tmp");
-    let body: String = keep.iter().map(|e| format!("{}\n", serde_json::to_string(e).unwrap())).collect();
-    let _ = fs::write(&tmp, body);
-    let _ = fs::rename(&tmp, &cfg.journal);
+    let bak = cfg.journal.with_extension("jsonl.bak");
+    let body: String = keep.iter().filter_map(|e| serde_json::to_string(e).ok()).map(|s| format!("{s}\n")).collect();
+    if fs::write(&tmp, body).is_ok() {
+        if cfg.journal.exists() {
+            let _ = fs::rename(&cfg.journal, &bak);
+        }
+        if fs::rename(&tmp, &cfg.journal).is_err() {
+            // 第二步失败：把旧日志放回原位（已物理复原的文件最多被重复报告，不会丢历史）
+            let _ = fs::rename(&bak, &cfg.journal);
+        } else {
+            let _ = fs::remove_file(&bak);
+        }
+    }
     let left: HashSet<String> = keep.iter().map(|e| e.batch.clone()).collect();
     UndoReport { restored, renamed, missing, batches_left: left.len() }
 }
 
 pub fn undo_last(cfg: &Config) -> UndoReport {
+    let _g = journal_guard();
     let all = read_entries(cfg);
     let Some(last_batch) = all.last().map(|e| e.batch.clone()) else {
         return UndoReport { restored: 0, renamed: 0, missing: vec![], batches_left: 0 };
@@ -326,6 +458,7 @@ pub fn undo_last(cfg: &Config) -> UndoReport {
 }
 
 pub fn undo_all(cfg: &Config) -> UndoReport {
+    let _g = journal_guard();
     let all = read_entries(cfg);
     undo_entries(cfg, all.clone(), all)
 }
@@ -367,7 +500,11 @@ pub fn snapshot(cfg: &Config) -> Snapshot {
                 for f in rd2.flatten() {
                     cnt += 1;
                     bytes += f.metadata().map(|m| m.len()).unwrap_or(0);
-                    files.push(f.file_name().to_string_lossy().to_string());
+                    // 服务端裁剪：每格最多回传 60 条路径（UI 本来也只显示 60 条）。
+                    // 2 万收件箱文件曾造成每次刷新 ~2.2MB JSON 过 IPC。
+                    if files.len() < 60 {
+                        files.push(f.path().to_string_lossy().to_string());
+                    }
                 }
             }
             files.sort();
@@ -389,7 +526,6 @@ pub fn snapshot(cfg: &Config) -> Snapshot {
 }
 
 // ================= v0.3 融合模块 =================
-use std::time::UNIX_EPOCH as _U;
 
 /// 领域扩展名映射（智能推荐底稿；覆盖不到的才建议新增格）
 fn domain_table() -> Vec<(&'static str, &'static [&'static str])> {
@@ -447,7 +583,7 @@ pub struct SuggestPlan {
 pub fn suggest_plan(cfg: &Config, threshold: usize) -> SuggestPlan {
     // histogram from desktop top-level files + inbox top-level files
     let mut hist: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-    let mut scan_dir = |dir: &Path, hist: &mut std::collections::BTreeMap<String, usize>| {
+    let scan_dir = |dir: &Path, hist: &mut std::collections::BTreeMap<String, usize>| {
         if let Ok(rd) = std::fs::read_dir(dir) {
             for e in rd.flatten() {
                 let p = e.path();
@@ -500,24 +636,34 @@ pub fn suggest_plan(cfg: &Config, threshold: usize) -> SuggestPlan {
 
 // ---- journal 批次管理（勾选复原）----
 #[derive(Serialize, Clone, Debug)]
-pub struct BatchInfo { pub batch: String, pub ts: u64, pub count: usize, pub groups: Vec<(String, usize)> }
+pub struct BatchInfo { pub batch: String, pub ts: u64, pub count: usize, pub groups: Vec<(String, usize)>, pub files: Vec<String> }
 
 pub fn list_batches(cfg: &Config) -> Vec<BatchInfo> {
     let all = read_entries(cfg);
-    let mut map: std::collections::HashMap<String, (u64, std::collections::HashMap<String, usize>)> = std::collections::HashMap::new();
+    let mut map: std::collections::HashMap<String, (u64, std::collections::HashMap<String, usize>, Vec<String>)> = std::collections::HashMap::new();
     for e in &all {
-        let entry = map.entry(e.batch.clone()).or_insert((e.ts, std::collections::HashMap::new()));
+        let entry = map.entry(e.batch.clone()).or_insert((e.ts, std::collections::HashMap::new(), Vec::new()));
         entry.0 = entry.0.max(e.ts);
-        *entry.1.entry(String::from("归档")).or_insert(0) += 1;
+        // 从落点路径反推真实分组（收件箱/<组>/...），而不是恒写「归档」
+        let g = std::path::Path::new(&e.new)
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "归档".into());
+        *entry.1.entry(g).or_insert(0) += 1;
+        if entry.2.len() < 200 {
+            entry.2.push(e.new.clone());
+        }
     }
     let mut out: Vec<BatchInfo> = map.into_iter()
-        .map(|(batch, (ts, groups))| BatchInfo { batch, ts, count: groups.values().sum(), groups: groups.into_iter().collect() })
+        .map(|(batch, (ts, groups, files))| BatchInfo { batch, ts, count: groups.values().sum(), groups: groups.into_iter().collect(), files })
         .collect();
     out.sort_by(|a, b| b.ts.cmp(&a.ts));
     out
 }
 
 pub fn undo_batches(cfg: &Config, sel: Vec<String>) -> UndoReport {
+    let _g = journal_guard();
     let all = read_entries(cfg);
     let sel_set: std::collections::HashSet<String> = sel.into_iter().collect();
     let chosen: Vec<Entry> = all.iter().filter(|e| sel_set.contains(&e.batch)).cloned().collect();
@@ -532,15 +678,14 @@ pub fn undo_batches(cfg: &Config, sel: Vec<String>) -> UndoReport {
 pub struct DupSet { pub sha: String, pub size: u64, pub count: usize, pub paths: Vec<String>, pub wasted: u64 }
 
 pub fn find_dups(root: &Path) -> Result<Vec<DupSet>, String> {
-    use sha2::{Digest, Sha256};
-
     fn collect_samesize(dir: &Path, sizes: &mut std::collections::HashMap<u64, Vec<String>>) -> Result<(), String> {
         let rd = std::fs::read_dir(dir).map_err(|e| format!("read_dir failed: {e}"))?;
         for e in rd {
             let e = e.map_err(|x| x.to_string())?;
             let p = e.path();
-            if p.file_name().and_then(|n| n.to_str()).map(|n| n.starts_with('_')).unwrap_or(false) {
-                continue; // skip _dup folders
+            // 只跳过查重归档区本身；`_notes.txt`、`_backup/` 等合法命名照常参与
+            if p.file_name().and_then(|n| n.to_str()).map(|n| n == "_重复待清理").unwrap_or(false) {
+                continue;
             }
             if p.is_dir() {
                 collect_samesize(&p, sizes)?;
@@ -560,10 +705,8 @@ pub fn find_dups(root: &Path) -> Result<Vec<DupSet>, String> {
         if paths.len() < 2 { continue; }
         let mut by_sha: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
         for p in &paths {
-            let h = std::fs::read(p).map_err(|e| e.to_string())?; // 大文件也硬读，内存换取确定性
-            let mut hasher = Sha256::new();
-            hasher.update(h.as_slice());
-            let digest = format!("{:x}", hasher.finalize());
+            // 流式 64KB 缓冲，避免等大文件（视频/镜像）整读入内存
+            let digest = sha256_of(Path::new(p)).ok_or_else(|| format!("hash failed: {p}"))?;
             by_sha.entry(digest).or_default().push(p.clone());
         }
         for (sha, ps) in by_sha {
@@ -625,24 +768,77 @@ pub fn archive_dups(cfg: &Config, sets: &[DupSet], keep_newest: bool) -> IngestR
 
 
 // ---- YAML 导入导出（organize 常用子集）----
+/// 组名安全化：禁止绝对路径 / `..` 穿越 / 冒号 / 控制字符；非法名回落「其他」。
+pub fn safe_group(name: &str) -> String {
+    let n = name.trim().trim_matches('"').trim_matches('\'').trim();
+    let bad = n.is_empty()
+        || n.chars().count() > 64
+        || n.contains('/')
+        || n.contains('\\')
+        || n.contains(':')
+        || n.contains("..")
+        || n == "."
+        || n.chars().any(|c| c.is_control());
+    if bad { "其他".to_string() } else { n.to_string() }
+}
+
+fn clean_group_name(raw: &str) -> Option<String> {
+    let n = raw.trim().trim_matches('"').trim_matches('\'').trim();
+    if n.is_empty() || n.chars().count() > 64 { return None; }
+    if n.chars().any(|c| c.is_control()) { return None; }
+    if n.contains('/') || n.contains('\\') || n.contains(':') || n.contains("..") || n == "." { return None; }
+    Some(n.to_string())
+}
+
+fn clean_ext_token(raw: &str) -> Option<String> {
+    let e = raw.trim().trim_matches('"').trim_matches('\'').trim().trim_start_matches('.');
+    if e.is_empty() || e.len() > 16 { return None; }
+    if e.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-') {
+        Some(e.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+/// 去掉行内注释：仅当 `#` 位于引号/方括号之外且前面是空白（URL 里的 # 不受影响）。
+fn strip_inline_comment(l: &str) -> &str {
+    let mut in_q = false;
+    let mut depth = 0i32;
+    let mut cut = l.len();
+    for (i, ch) in l.char_indices() {
+        match ch {
+            '"' | '\'' => in_q = !in_q,
+            '[' if !in_q => depth += 1,
+            ']' if !in_q => depth -= 1,
+            '#' if !in_q && depth <= 0 => {
+                let before = &l[..i];
+                if before.is_empty() || before.ends_with(' ') || before.ends_with('\t') {
+                    cut = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    l[..cut].trim_end()
+}
+
 /// 导出：NestDesk 子集格式，可直接复制回 organize CLI 的 rules
 pub fn export_yaml(groups: &[(String, Vec<String>)]) -> String {
-    let mut out = String::from("groups:
-");
+    let mut out = String::from("groups:\n");
     for (name, exts) in groups {
-        out.push_str(&format!("  - name: {}
-    exts: [{}]
-", name, exts.join(", ")));
+        out.push_str(&format!("  - name: {}\n    exts: [{}]\n", name, exts.join(", ")));
     }
     out
 }
 
 /// 导入：容忍 NestDesk 子集与 organize CLI 两种布局的捕捉器
 /// organize CLI 样式：rules: [ { folder: X, extensions: [png] }, ... ] 或 - createfolder: X / extensions  [png]
+/// 与 export_yaml 严格互逆：`- name:` + `exts:` 必须能导回。
 pub fn import_yaml(text: &str) -> Result<Vec<(String, Vec<String>)>, String> {
     let mut out: Vec<(String, Vec<String>)> = Vec::new();
     let mut cur: Option<(String, Vec<String>)> = None;
-    let mut flush = |cur: &mut Option<(String, Vec<String>)>, out: &mut Vec<_>| {
+    let flush = |cur: &mut Option<(String, Vec<String>)>, out: &mut Vec<(String, Vec<String>)>| {
         if let Some((name, mut exts)) = cur.take() {
             exts.sort();
             exts.dedup();
@@ -652,56 +848,51 @@ pub fn import_yaml(text: &str) -> Result<Vec<(String, Vec<String>)>, String> {
         }
     };
     for raw in text.lines() {
-        let l = raw.trim();
+        let l = strip_inline_comment(raw.trim());
         if l.is_empty() || l.starts_with('#') { continue; }
-        // 文件夹名锚点
+        // 文件夹名锚点：兼容 export 自身（`- name:`）与 organize（`- folder:` / `- createfolder:` / 裸 `name:`）
         let anchor = |l: &str| -> Option<String> {
-            if let Some(rest) = l.strip_prefix("- createfolder:").or_else(|| l.strip_prefix("- create_folder:")).or_else(|| l.strip_prefix("- folder:")) {
-                Some(rest.trim().trim_matches('"').to_string())
-            } else if let Some(rest) = l.strip_prefix("name:") {
-                Some(rest.trim().trim_matches('"').to_string())
-            } else { None }
+            for prefix in ["- createfolder:", "- create_folder:", "- folder:", "- name:", "name:"] {
+                if let Some(rest) = l.strip_prefix(prefix) {
+                    return clean_group_name(rest);
+                }
+            }
+            None
         };
         if let Some(name) = anchor(l) {
             flush(&mut cur, &mut out);
             cur = Some((name, Vec::new()));
             continue;
         }
-        // extensions: [png jpg] 或 extensions:
-        if let Some(arr) = l.strip_prefix("extensions:") {
+        // extensions / exts 两种键（export 用 exts）
+        if let Some(arr) = l.strip_prefix("extensions:").or_else(|| l.strip_prefix("exts:")) {
             let body = arr.trim();
             if body.starts_with('[') && body.ends_with(']') {
-                let inner = body.trim_matches(['[', ']']);
-                let exts: Vec<String> = inner.split(|c| c == ',' || c == ' ')
-                    .map(|x| x.trim().trim_matches('"').to_string())
-                    .filter(|x| !x.is_empty() && !x.contains(':') )
-                    .map(|x| x.to_ascii_lowercase())
-                    .collect();
-                if !exts.is_empty() {
-                    if let Some(g) = cur.as_mut() { g.1.extend(exts); }
+                let inner = body.trim_start_matches('[').trim_end_matches(']');
+                for tok in inner.split(|c| c == ',' || c == ' ') {
+                    if let Some(e) = clean_ext_token(tok) {
+                        if let Some(g) = cur.as_mut() { g.1.push(e); }
+                    }
                 }
             }
             continue;
         }
         // 单项列表组件 - extension: png / - png
-        if l.starts_with("- ") {
-            let item = &l[2..];
+        if let Some(item) = l.strip_prefix("- ") {
             if let Some(e) = item.strip_prefix("extension:").or_else(|| item.strip_prefix("ext:")) {
-                let e = e.trim().trim_matches('"').to_string();
-                if !e.is_empty() && !e.contains(':') {
-                    if let Some(g) = cur.as_mut() { g.1.push(e.to_ascii_lowercase()); }
+                if let Some(x) = clean_ext_token(e) {
+                    if let Some(g) = cur.as_mut() { g.1.push(x); }
                 }
             } else if !item.contains(':') && !item.starts_with('#') && !item.starts_with('-') {
-                let e = item.trim_matches('"');
-                if !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric() || c == '.') {
-                    if let Some(g) = cur.as_mut() { g.1.push(e.to_string()); }
+                if let Some(x) = clean_ext_token(item) {
+                    if let Some(g) = cur.as_mut() { g.1.push(x); }
                 }
             }
         }
     }
     flush(&mut cur, &mut out);
     if out.is_empty() {
-        return Err("未解析出任何归纳文件夹规则".into());
+        return Err("未解析出任何合法归纳文件夹规则（需 name/folder 锚点 + 至少一个扩展名；组名不允许包含 / \\ : .. 或控制字符）".into());
     }
     Ok(out)
 }

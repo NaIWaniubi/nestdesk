@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "panel-clock",
+  "description": "时钟：时间/农历/皮肤",
+  "windows": ["clock"],
+  "permissions": ["core:default", "allow-lunar-now", "allow-theme-get", "allow-theme-set"]
+}

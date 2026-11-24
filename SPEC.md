@@ -89,7 +89,14 @@
   代码 nestdesk-app/；spike 结论已固化进 layer.rs。
 - ✅ v0.3（2026-11-24）：融合开源能力——控制台五标签（桌面勾选收取/归纳+✨智能推荐方案+organize 兼容 YAML 导入导出/事务批次勾选回滚/Czkawka 式 SHA-256 查重→_重复待清理过 journal 可复原/透明度+皮肤）；selftest 16/16。
 - ✅ v0.4（2026-11-24）：双参照融合（vendor/folia AGPL、vendor/deskbox GPL，均只借范式不抄码）——S-A copy-verify 跨卷、S-B 链接拖放下载、S-C 农历时钟（.NET 日历实测正确：2026-11-24=农历十月十六·马年）、S-D 待办组件、S-E Folia 进程托管入口；selftest 16/16、demo 355/355 回归通过；详见 FUSION-PLAN.md。
-- ⏳ 待办：托盘+全局快捷键、开机自启、年龄/大小规则、天气倒计时、剪贴板历史。
+- ✅ v0.5（2026-11-24）：**五视角审查集群（功能/Win32/数据/架构/性能）80 条 finding → P0/P1 全修**。
+  数据层：move_any 无哈希不搬（含目录逐文件比对）、save_url 120s 超时+撤销语义（`@url|` 哨兵）、
+  journal 原子替换+读写互斥、查重流式哈希、YAML 导出导入严格互逆、组名防穿越；
+  窗口层：`SW_SHOWNOACTIVATE`（不抢焦点）、死 HWND 清理、屏外钳制、alpha/Z 序变化才下发；
+  安全：AppManifest + 6 窗口拆分 capability（最小权限，22 项授权矩阵实测通过）、CSP 收敛；
+  体验：双击打开/右键定位、透明度即时预览、批次文件清单、桌面列表可展开、对比度/焦点可见性。
+  **selftest 20/20**；真机端到端 3 文件 ingest→undo 字节级一致。汇总见 REVIEW-SUMMARY.md。
+- ⏳ 待办：托盘+全局快捷键、开机自启、年龄/大小规则、天气倒计时、剪贴板历史、桌面目录监听自动归档、AI 语义分类、归档周报。
 
 ## 6. 非目标（MVP 明确不做）
 Dock/桌面栏、完整音乐播放器（仅留 now-playing 数据接口给 music 组件）、规则 YAML 编辑器、多用户同步、macOS/Linux。

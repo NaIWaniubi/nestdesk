@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-music-set"
+description = "Enables the music_set command without any pre-configured scope."
+commands.allow = ["music_set"]
+
+[[permission]]
+identifier = "deny-music-set"
+description = "Denies the music_set command without any pre-configured scope."
+commands.deny = ["music_set"]

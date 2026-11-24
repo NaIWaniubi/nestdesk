@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-shelf-snapshot"
+description = "Enables the shelf_snapshot command without any pre-configured scope."
+commands.allow = ["shelf_snapshot"]
+
+[[permission]]
+identifier = "deny-shelf-snapshot"
+description = "Denies the shelf_snapshot command without any pre-configured scope."
+commands.deny = ["shelf_snapshot"]

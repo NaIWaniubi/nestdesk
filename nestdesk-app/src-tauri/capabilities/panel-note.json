@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "panel-note",
+  "description": "便利贴：读写/皮肤",
+  "windows": ["note"],
+  "permissions": ["core:default", "allow-note-get", "allow-note-set", "allow-theme-get", "allow-theme-set"]
+}

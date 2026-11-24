@@ -256,7 +256,20 @@ function Shelf() {
         {snap?.inbox.map((g) => (
           <details className="group" key={g.group}>
             <summary>{GROUP_ICON[g.group]} {g.group}<span className="n">{g.count} 个 · {fmtBytes(g.bytes)}</span></summary>
-            <div className="files">{g.files.slice(0, 60).join("、")}{g.files.length > 60 ? ` …共 ${g.files.length}` : ""}</div>
+            <div className="files">
+              {g.files.slice(0, 60).map((p) => {
+                const name = p.split(/[\\/]/).pop() || p;
+                return (
+                  <span key={p} className="nodrag" title={`${p}\n双击打开 · 右键定位`}
+                    onDoubleClick={() => invoke("open_path", { path: p }).catch(() => setToast("打开失败，文件可能已移动"))}
+                    onContextMenu={(e) => { e.preventDefault(); invoke("reveal_path", { path: p }).catch(() => {}); }}
+                    style={{ display: "block", padding: "1px 0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {name}
+                  </span>
+                );
+              })}
+              {g.files.length > 60 ? ` …共 ${g.files.length}` : ""}
+            </div>
           </details>
         ))}
       </div>
@@ -276,7 +289,7 @@ function Shelf() {
 interface GroupRule { name: string; exts: string[] }
 interface AppSettings { groups: GroupRule[]; alpha: Record<string, number> }
 const ALPHA_KEYS = [
-  ["shelf", "收纳框"], ["clock", "时钟"], ["sysmon", "系统监视"], ["note", "便利贴"],
+  ["shelf", "收纳框"], ["clock", "时钟"], ["sysmon", "系统监视"], ["note", "便利贴"], ["todo", "待办"],
 ] as const;
 
 interface SuggestPlanT {
@@ -284,8 +297,6 @@ interface SuggestPlanT {
   suggested: { name: string; exts: string[] }[];
   reason: string;
 }
-interface GroupRule { name: string; exts: string[] }
-interface AppSettings { groups: GroupRule[]; alpha: Record<string, number> }
 
 function Settings() {
   type Tab = "桌面" | "归纳" | "事务" | "查重" | "更多";
@@ -299,6 +310,9 @@ function Settings() {
   interface DeskItemT { path: string; name: string; size: number; is_dir: boolean; group: string }
   const [desk, setDesk] = useState<DeskItemT[]>([]);
   const [pick, setPick] = useState<Record<number, boolean>>({});
+  const [showAllDesk, setShowAllDesk] = useState(false);
+  const DESK_LIMIT = 120;
+  const deskShown = showAllDesk ? desk : desk.slice(0, DESK_LIMIT);
   const loadDesk = () => invoke<DeskItemT[]>("shelf_desk_items").then(setDesk).catch(() => {});
   useEffect(() => { loadDesk(); }, []);
   const collectPicked = async () => {
@@ -318,20 +332,27 @@ function Settings() {
     setSugg(p.suggested);
   };
   const applySugg = async () => {
-    const merged = [...groups];
+    if (!sugg.length) { setMsg("先点「✨ 智能推荐方案」生成建议"); return; }
+    // 先取后端最新设置再合并：冷启动 settings_get 未返回时点应用，不会把用户分组表覆盖成空
+    const cur = await invoke<AppSettings>("settings_get");
+    const merged = [...cur.groups];
     for (const s of sugg) if (!merged.some((g) => g.name === s.name)) merged.push({ name: s.name, exts: s.exts });
-    await invoke("settings_save", { groups: merged, alpha });
-    setGroups(merged); setSugg([]); setSaved(`应用推荐：${sugg.length} 个新归纳文件夹`);
+    const r = await invoke<AppSettings>("settings_save", { groups: merged, alpha: cur.alpha });
+    setGroups(r.groups); setAlpha(r.alpha); setSugg([]); setSaved(`应用推荐：${sugg.length} 个新归纳文件夹`);
   };
   const doYamlExport = async () => { const t = await invoke<string>("yaml_export"); downloadText("nestdesk-groups.yaml", t); setMsg("已导出 yaml"); };
   const doYamlImport = async () => {
     const f = prompt("粘贴 organize/NestDesk 兼容的 yml 规则文本："); if (!f) return;
-    const ns = await invoke<AppSettings>("yaml_import", { text: f });
-    setGroups(ns.groups); setAlpha(ns.alpha); setSaved(`导入 ${ns.groups.length} 个归纳文件夹`);
+    try {
+      const ns = await invoke<AppSettings>("yaml_import", { text: f });
+      setGroups(ns.groups); setAlpha(ns.alpha); setSaved(`导入 ${ns.groups.length} 个归纳文件夹`);
+    } catch (e) {
+      setMsg(`导入失败：${String(e)}`);
+    }
   };
 
   // ---- 事务批次 ----
-  interface BatchT { batch: string; ts: number; count: number; groups: [string, number][] }
+  interface BatchT { batch: string; ts: number; count: number; groups: [string, number][]; files: string[] }
   const [batches, setBatches] = useState<BatchT[]>([]);
   const [bpick, setBPick] = useState<Record<number, boolean>>({});
   const loadB = () => invoke<BatchT[]>("shelf_batches").then(setBatches).catch(() => {});
@@ -366,8 +387,15 @@ function Settings() {
   const save = async () => {
     const clean = groups.map((g) => ({ ...g, name: g.name.trim() })).filter((g) => g.name);
     if (!clean.length) { setSaved("至少要保留一个归纳文件夹"); return; }
+    const bad = clean.filter((g) => /[\/\\:]/.test(g.name) || g.name.includes("..") || g.name === ".");
+    if (bad.length) { setSaved(`组名不能包含 / \\ : 或 ..：${bad.map((b) => b.name).join("、")}`); return; }
     if (!clean.some((g) => g.name === "其他")) clean.push({ name: "其他", exts: [] });
-    await invoke("settings_save", { groups: clean, alpha }); setGroups(clean); setSaved(`✓ 已保存：${clean.length} 个归纳文件夹`);
+    try {
+      const r = await invoke<AppSettings>("settings_save", { groups: clean, alpha });
+      setGroups(r.groups); setAlpha(r.alpha); setSaved(`✓ 已保存：${r.groups.length} 个归纳文件夹`);
+    } catch (e) {
+      setSaved(`保存失败：${String(e)}`);
+    }
   };
 
   // ---- 音乐宿主（S-E）：启动 Folia 或配置的播放器 ----
@@ -404,14 +432,22 @@ function Settings() {
           <>
             <div style={{ fontSize: 12, color: "var(--dim)", marginBottom: 6 }}>勾选要收取进归纳体系的文件（按系统推荐归类）：</div>
             {desk.length === 0 && <div style={{ fontSize: 11, color: "var(--dim)" }}>载入中…或桌面暂无文件</div>}
-            {desk.slice(0, 120).map((d, i) => (
+            {deskShown.map((d, i) => (
               <label key={d.path} style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 11, padding: "3px 0" }}>
                 <input type="checkbox" checked={!!pick[i]} onChange={(e) => setPick((p) => ({ ...p, [i]: e.target.checked }))} />
-                <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{d.name}{d.is_dir ? "/" : ""}</span>
+                <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={d.path}>{d.name}{d.is_dir ? "/" : ""}</span>
                 <span style={{ color: "var(--dim)" }}>{fmtBytes(d.size)}</span>
                 <span style={{ color: "var(--accent)", minWidth: 56, textAlign: "right" }}>{d.group}</span>
               </label>
             ))}
+            {desk.length > DESK_LIMIT && (
+              <div style={{ fontSize: 11, color: "var(--dim)", marginTop: 4 }}>
+                仅显示前 {DESK_LIMIT} / 共 {desk.length} 项
+                <span className="btn nodrag" style={{ marginLeft: 8 }} onClick={() => setShowAllDesk((v) => !v)}>
+                  {showAllDesk ? "收起" : "显示全部"}
+                </span>
+              </div>
+            )}
             <div style={{ marginTop: 10 }}><span className="btn nodrag" onClick={collectPicked}>⬇ 收取勾选的 {Object.values(pick).filter(Boolean).length} 个</span></div>
           </>
         )}
@@ -448,11 +484,17 @@ function Settings() {
             <div style={{ fontSize: 12, color: "var(--dim)", marginBottom: 6 }}>事务日志按批记录，勾选要回滚的批次：</div>
             {batches.length === 0 && <div style={{ fontSize: 11, color: "var(--dim)" }}>暂无事务记录</div>}
             {batches.map((b, i) => (
-              <label key={b.batch} style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 11, padding: "4px 0" }}>
-                <input type="checkbox" checked={!!bpick[i]} onChange={(e) => setBPick((p) => ({ ...p, [i]: e.target.checked }))} />
-                <span style={{ flex: 1 }}>{new Date(b.ts).toLocaleString()} · {b.count} 个文件 · {b.groups.map((g) => `${g[0]}(${g[1]})`).join("、")}</span>
-                <span style={{ color: "var(--dim)" }}>{b.batch.slice(-6)}</span>
-              </label>
+              <details key={b.batch} style={{ borderBottom: "1px solid var(--border)", padding: "2px 0" }}>
+                <summary style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 11, padding: "4px 0", cursor: "pointer" }}>
+                  <input type="checkbox" checked={!!bpick[i]} onClick={(e) => e.stopPropagation()} onChange={(e) => setBPick((p) => ({ ...p, [i]: e.target.checked }))} />
+                  <span style={{ flex: 1 }}>{new Date(b.ts).toLocaleString()} · {b.count} 个文件 · {b.groups.map((g) => `${g[0]}(${g[1]})`).join("、")}</span>
+                  <span style={{ color: "var(--dim)" }}>{b.batch.slice(-6)}</span>
+                </summary>
+                <div style={{ fontSize: 10, color: "var(--dim)", padding: "2px 0 6px 24px", whiteSpace: "pre-wrap" }}>
+                  {b.files.slice(0, 20).map((p) => p.split(/[\\/]/).pop()).join("、")}
+                  {b.files.length > 20 ? ` …共 ${b.count} 个` : ""}
+                </div>
+              </details>
             ))}
             <div style={{ marginTop: 10, display: "flex", gap: 8 }}>
               <span className="btn nodrag" onClick={undoSel}>↩ 复原勾选批次</span>
@@ -488,13 +530,19 @@ function Settings() {
               <div key={k} className="mon-row" style={{ marginBottom: 6 }}>
                 <div className="lbl"><span>{label}</span><span>{Math.round((alpha[k] ?? 250) / 255 * 100)}%</span></div>
                 <input type="range" min={30} max={255} style={{ width: "100%", accentColor: "var(--accent)" }}
-                  value={alpha[k] ?? 250} onChange={(e) => setAlpha((a) => ({ ...a, [k]: Number(e.target.value) }))} />
+                  value={alpha[k] ?? 250} onChange={(e) => {
+                    const v = Number(e.target.value);
+                    setAlpha((a) => ({ ...a, [k]: v }));
+                    // 即时预览：后端 <=2s 应用到 LWA_ALPHA（持久化由下方「保存」统一做）
+                    invoke("alpha_live", { label: k, alpha: v }).catch(() => {});
+                  }} />
               </div>
             ))}
+            <div style={{ marginTop: 4 }}><span className="btn nodrag" onClick={save}>💾 保存透明度</span></div>
             <div style={{ fontSize: 12, color: "var(--dim)", margin: "12px 0 8px" }}>音乐（S-E：Folia/其他播放器托管）</div>
             <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 6 }}>
               <input className="nodrag" style={{ flex: 1, background: "var(--bar-bg)", border: "1px solid var(--border)", color: "var(--text)", borderRadius: 8, padding: "6px 9px", fontSize: 12 }}
-                placeholder="播放器 exe 完整路径，如 E:\myzcodeoliaolia.exe" value={player}
+                placeholder="播放器 exe 完整路径，如 C:\Program Files\Folia\Folia.exe" value={player}
                 onChange={(e) => setPlayer(e.target.value)} />
               <span className="btn nodrag" onClick={savePlayer}>存路径</span>
             </div>
@@ -508,7 +556,7 @@ function Settings() {
                 </span>
               ))}
             </div>
-            <div style={{ marginTop: 12, fontSize: 11, color: "var(--dim)" }}>透明度滑块改后点「💾 保存归纳设置」即写入并 ≤2 秒生效。</div>
+            <div style={{ marginTop: 12, fontSize: 11, color: "var(--dim)" }}>透明度拖动即时预览，≤2 秒生效；点「💾 保存透明度」持久化到 settings.json。</div>
           </>
         )}
       </div>

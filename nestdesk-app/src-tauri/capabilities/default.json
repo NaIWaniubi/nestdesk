@@ -1,9 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "NestDesk surfaces（收纳框/时钟/监视/便利贴）",
-  "windows": ["shelf", "clock", "sysmon", "note", "todo", "settings"],
-  "permissions": [
-    "core:default"
-  ]
+  "description": "NestDesk 控制台（settings 窗口）：全部应用命令",
+  "windows": ["settings"],
+  "permissions": ["core:default", "default"]
 }

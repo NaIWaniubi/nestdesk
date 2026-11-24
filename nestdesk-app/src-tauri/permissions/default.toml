@@ -1,0 +1,37 @@
+# 应用级默认权限集：仅控制台窗口使用（它确实需要全部命令）。
+# 桌面面板按 capabilities/panel-*.json 各自最小授权。
+[default]
+description = "NestDesk 全部应用命令（控制台）"
+permissions = [
+  "allow-shelf-snapshot",
+  "allow-shelf-ingest",
+  "allow-shelf-collect-desktop",
+  "allow-shelf-undo-last",
+  "allow-shelf-undo-all",
+  "allow-get-sysinfo",
+  "allow-note-get",
+  "allow-note-set",
+  "allow-theme-get",
+  "allow-theme-set",
+  "allow-settings-get",
+  "allow-settings-save",
+  "allow-shelf-desk-items",
+  "allow-plan-suggest",
+  "allow-yaml-export",
+  "allow-yaml-import",
+  "allow-shelf-batches",
+  "allow-shelf-undo-selected",
+  "allow-dup-scan",
+  "allow-dup-archive",
+  "allow-shelf-save-url",
+  "allow-todo-list",
+  "allow-todo-add",
+  "allow-todo-toggle",
+  "allow-todo-del",
+  "allow-music-open",
+  "allow-lunar-now",
+  "allow-music-set",
+  "allow-open-path",
+  "allow-reveal-path",
+  "allow-alpha-live",
+]

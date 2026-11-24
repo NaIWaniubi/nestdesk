@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-yaml-export"
+description = "Enables the yaml_export command without any pre-configured scope."
+commands.allow = ["yaml_export"]
+
+[[permission]]
+identifier = "deny-yaml-export"
+description = "Denies the yaml_export command without any pre-configured scope."
+commands.deny = ["yaml_export"]

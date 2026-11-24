@@ -1,3 +1,40 @@
 fn main() {
-    tauri_build::build()
+    // 自定义命令进入 App ACL manifest：运行时可审计、可按窗口最小授权。
+    // 与 capabilities/*.json 中的 allow-* 一一对应（漏一个会在运行时被拒绝）。
+    tauri_build::try_build(
+        tauri_build::Attributes::new().app_manifest(tauri_build::AppManifest::new().commands(&[
+            "shelf_snapshot",
+            "shelf_ingest",
+            "shelf_collect_desktop",
+            "shelf_undo_last",
+            "shelf_undo_all",
+            "get_sysinfo",
+            "note_get",
+            "note_set",
+            "theme_get",
+            "theme_set",
+            "settings_get",
+            "settings_save",
+            "shelf_desk_items",
+            "plan_suggest",
+            "yaml_export",
+            "yaml_import",
+            "shelf_batches",
+            "shelf_undo_selected",
+            "dup_scan",
+            "dup_archive",
+            "shelf_save_url",
+            "todo_list",
+            "todo_add",
+            "todo_toggle",
+            "todo_del",
+            "music_open",
+            "lunar_now",
+            "music_set",
+            "open_path",
+            "reveal_path",
+            "alpha_live",
+        ])),
+    )
+    .expect("failed to run tauri-build");
 }

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-dup-archive"
+description = "Enables the dup_archive command without any pre-configured scope."
+commands.allow = ["dup_archive"]
+
+[[permission]]
+identifier = "deny-dup-archive"
+description = "Denies the dup_archive command without any pre-configured scope."
+commands.deny = ["dup_archive"]

@@ -1,0 +1,20 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "panel-shelf",
+  "description": "收纳框：归档/复原/下载/打开文件",
+  "windows": ["shelf"],
+  "permissions": [
+    "core:default",
+    "allow-shelf-snapshot",
+    "allow-shelf-ingest",
+    "allow-shelf-collect-desktop",
+    "allow-shelf-undo-last",
+    "allow-shelf-undo-all",
+    "allow-shelf-save-url",
+    "allow-open-path",
+    "allow-reveal-path",
+    "allow-alpha-live",
+    "allow-theme-get",
+    "allow-theme-set"
+  ]
+}

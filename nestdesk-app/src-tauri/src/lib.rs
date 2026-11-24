@@ -2,13 +2,13 @@
 mod fs_core;
 mod layer;
 
-use fs_core::{Config, DeskItem, DupSet, GroupRule2, IngestResult, Snapshot, SuggestPlan, UndoReport};
+use fs_core::{Config, DeskItem, DupSet, IngestResult, Snapshot, SuggestPlan, UndoReport};
 use std::process::Command;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 use tauri::{Manager, PhysicalPosition, PhysicalSize, Position, Size};
 
@@ -27,16 +27,20 @@ fn user_home() -> PathBuf {
     PathBuf::from(std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into()))
 }
 fn desktop_dir() -> PathBuf {
-    // OneDrive 重定向时 USERPROFILE\Desktop 可能是假路径 → 问系统要真实桌面
-    let found = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", "[Environment]::GetFolderPath('Desktop')"])
-        .output()
-        .ok()
-        .and_then(|o| {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if !s.is_empty() && Path::new(&s).exists() { Some(PathBuf::from(s)) } else { None }
-        });
-    found.unwrap_or_else(|| user_home().join("Desktop"))
+    // 会话内路径不变：memoize，避免每个 command 都拉起一次 powershell
+    static DESKTOP: OnceLock<PathBuf> = OnceLock::new();
+    DESKTOP.get_or_init(|| {
+        // OneDrive 重定向时 USERPROFILE\Desktop 可能是假路径 → 问系统要真实桌面
+        let found = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", "[Environment]::GetFolderPath('Desktop')"])
+            .output()
+            .ok()
+            .and_then(|o| {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if !s.is_empty() && Path::new(&s).exists() { Some(PathBuf::from(s)) } else { None }
+            });
+        found.unwrap_or_else(|| user_home().join("Desktop"))
+    }).clone()
 }
 
 // ---------- 控制台设置（分组表 + 每面板透明度） ----------
@@ -68,10 +72,14 @@ fn init_settings() {
         return;
     }
     let path = settings_path();
+    let bak = settings_path().with_extension("json.bak");
+    let parse = |p: &PathBuf| fs::read_to_string(p).ok().and_then(|s| serde_json::from_str::<AppSettings>(&s).ok());
     let base = if path.exists() {
-        fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<AppSettings>(&s).ok())
+        parse(&path)
+            .or_else(|| {
+                // 主文件损坏时用上一份 .bak 自愈，而不是静默回退默认设置
+                if bak.exists() { parse(&bak) } else { None }
+            })
             .unwrap_or_else(settings_defaults)
     } else {
         settings_defaults()
@@ -89,18 +97,23 @@ fn init_settings() {
 }
 
 fn current_settings() -> AppSettings {
-    SETTINGS.get().map(|r| r.read().unwrap().clone()).unwrap_or_else(settings_defaults)
+    SETTINGS.get().map(|r| r.read().unwrap_or_else(|e| e.into_inner()).clone()).unwrap_or_else(settings_defaults)
 }
 
 fn save_settings_file() {
     if let Some(r) = SETTINGS.get() {
-        let s = r.read().unwrap().clone();
+        let s = r.read().unwrap_or_else(|e| e.into_inner()).clone();
         if let Ok(txt) = serde_json::to_string_pretty(&s) {
             let tmp = settings_path().with_extension("json.tmp");
-            let _ = fs::write(&tmp, txt);
-            let bak = settings_path().with_extension("json.bak");
             let main = settings_path();
-            if main.exists() { let _ = fs::rename(&main, bak); }
+            let bak = settings_path().with_extension("json.bak");
+            if fs::write(&tmp, txt).is_err() {
+                return;
+            }
+            // 顺序：先复制旧文件为 .bak（主文件始终存在），再原子替换主文件
+            if main.exists() {
+                let _ = fs::copy(&main, &bak);
+            }
             let _ = fs::rename(&tmp, &main);
         }
     }
@@ -137,6 +150,46 @@ fn shelf_undo_last() -> UndoReport {
 #[tauri::command]
 fn shelf_undo_all() -> UndoReport {
     fs_core::undo_all(&real_cfg())
+}
+
+// ---------- 文件交互（双击打开 / 资源管理器定位） ----------
+#[tauri::command]
+fn open_path(path: String) -> Result<(), String> {
+    let p = PathBuf::from(&path);
+    if !p.exists() {
+        return Err("文件不存在（可能已被移动或删除）".into());
+    }
+    std::process::Command::new("explorer.exe")
+        .arg(&path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn reveal_path(path: String) -> Result<(), String> {
+    let p = PathBuf::from(&path);
+    if !p.exists() {
+        return Err("文件不存在（可能已被移动或删除）".into());
+    }
+    std::process::Command::new("explorer.exe")
+        .arg(format!("/select,{}", p.to_string_lossy()))
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// 透明度拖动时的即时预览：只改内存中的设置，钉扎循环 ≤2s 应用到 LWA_ALPHA。
+/// 落盘仍由「保存」按钮统一执行。
+#[tauri::command]
+fn alpha_live(label: String, alpha: u32) {
+    if !SURFACES.contains(&label.as_str()) {
+        return;
+    }
+    if let Some(r) = SETTINGS.get() {
+        let mut s = r.write().unwrap_or_else(|e| e.into_inner());
+        s.alpha.insert(label, alpha.clamp(30, 255));
+    }
 }
 
 // ---------- 系统监视 command ----------
@@ -177,7 +230,11 @@ fn theme_get() -> String {
 }
 #[tauri::command]
 fn theme_set(theme: String) {
-    let _ = fs::write(data_dir().join("config.json"), format!("{{\"theme\":\"{theme}\"}}"));
+    // serde 序列化而非手拼 JSON：主题名含引号/反斜杠也不会写坏 config.json
+    let v = serde_json::json!({ "theme": theme });
+    if let Ok(txt) = serde_json::to_string(&v) {
+        let _ = fs::write(data_dir().join("config.json"), txt);
+    }
 }
 
 // ---------- v0.3 控制台融合 commands ----------
@@ -204,21 +261,20 @@ fn yaml_export() -> String {
 }
 
 #[tauri::command]
-fn yaml_import(text: String) -> AppSettings {
-    if let Ok(groups) = fs_core::import_yaml(&text) {
-        if !groups.is_empty() {
-            let mut s = current_settings();
-            // merge: replace groups entirely with parsed ones + ensure 其他 fallback
-            s.groups = groups.into_iter().map(|(n, e)| GroupRule { name: n, exts: e }).collect();
-            if !s.groups.iter().any(|g| g.name == "其他") {
-                s.groups.push(GroupRule { name: "其他".into(), exts: vec![] });
-            }
-            if let Some(r) = SETTINGS.get() { *r.write().unwrap() = s.clone(); }
-            save_settings_file();
-            return s;
-        }
+fn yaml_import(text: String) -> Result<AppSettings, String> {
+    // 解析失败必须让前端看到原因，不再静默回退 current_settings 假装成功
+    let groups = fs_core::import_yaml(&text)?;
+    if groups.is_empty() {
+        return Err("未解析出任何归纳文件夹规则".into());
     }
-    current_settings()
+    let mut s = current_settings();
+    s.groups = groups.into_iter().map(|(n, e)| GroupRule { name: n, exts: e }).collect();
+    if !s.groups.iter().any(|g| g.name == "其他") {
+        s.groups.push(GroupRule { name: "其他".into(), exts: vec![] });
+    }
+    if let Some(r) = SETTINGS.get() { *r.write().unwrap_or_else(|e| e.into_inner()) = s.clone(); }
+    save_settings_file();
+    Ok(s)
 }
 
 #[tauri::command]
@@ -258,10 +314,14 @@ fn layout_path() -> PathBuf { data_dir().join("layout.json") }
 struct LayoutFile(HashMap<String, Geom>);
 
 fn load_layout() -> HashMap<String, Geom> {
-    fs::read_to_string(layout_path())
-        .ok()
-        .and_then(|s| serde_json::from_str::<LayoutFile>(&s).ok())
-        .map(|l| l.0)
+    let parse = |p: &Path| fs::read_to_string(p).ok().and_then(|s| serde_json::from_str::<LayoutFile>(&s).ok()).map(|l| l.0);
+    let main = layout_path();
+    parse(&main)
+        .or_else(|| {
+            // 主文件损坏时用上一份 .bak 自愈（与 settings 同策略）
+            let bak = layout_path().with_extension("json.bak");
+            if bak.exists() { parse(&bak) } else { None }
+        })
         .unwrap_or_default()
 }
 
@@ -286,11 +346,27 @@ fn settings_get() -> AppSettings {
 
 #[tauri::command]
 fn settings_save(groups: Vec<GroupRule>, alpha: HashMap<String, u32>) -> AppSettings {
-    if groups.is_empty() {
+    // 组名/扩展名清洗：禁止路径穿越与目录注入（手改 settings.json 或 UI 输入同样兜底）
+    let mut seen = std::collections::HashSet::new();
+    let mut cleaned: Vec<GroupRule> = Vec::new();
+    for g in groups {
+        let name = fs_core::safe_group(&g.name);
+        if !seen.insert(name.clone()) { continue; }
+        let exts: Vec<String> = g.exts.into_iter()
+            .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
+            .filter(|e| !e.is_empty() && e.len() <= 16
+                && e.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'))
+            .collect();
+        cleaned.push(GroupRule { name, exts });
+    }
+    if cleaned.is_empty() {
         return current_settings();
     }
+    if !cleaned.iter().any(|g| g.name == "其他") {
+        cleaned.push(GroupRule { name: "其他".into(), exts: vec![] });
+    }
     let mut s = current_settings();
-    s.groups = groups;
+    s.groups = cleaned;
     for k in SURFACES {
         s.alpha.entry(k.to_string()).or_insert(250);
     }
@@ -300,7 +376,7 @@ fn settings_save(groups: Vec<GroupRule>, alpha: HashMap<String, u32>) -> AppSett
         }
     }
     if let Some(r) = SETTINGS.get() {
-        *r.write().unwrap() = s.clone();
+        *r.write().unwrap_or_else(|e| e.into_inner()) = s.clone();
     }
     save_settings_file();
     s
@@ -432,6 +508,36 @@ fn surfaces(app: &tauri::AppHandle) -> Vec<tauri::WebviewWindow> {
     SURFACES.iter().filter_map(|l| app.get_webview_window(l)).collect()
 }
 
+/// 参与几何记忆的窗口：5 个桌面面板 + 控制台。控制台不参与沉底/透明处理。
+fn layout_windows(app: &tauri::AppHandle) -> Vec<tauri::WebviewWindow> {
+    let mut v = surfaces(app);
+    if let Some(w) = app.get_webview_window("settings") { v.push(w); }
+    v
+}
+
+/// 屏外/负坐标钳制：至少 40×40 可见才保留，否则拉回主屏左上安全区（W-01）。
+fn clamp_geom(app: &tauri::AppHandle, g: Geom) -> Geom {
+    let mons = app.available_monitors().unwrap_or_default();
+    if mons.is_empty() { return g; }
+    for m in &mons {
+        let p = m.position();
+        let s = m.size();
+        let ix = (g.x + g.w as i32).min(p.x + s.width as i32) - g.x.max(p.x);
+        let iy = (g.y + g.h as i32).min(p.y + s.height as i32) - g.y.max(p.y);
+        if ix >= 40 && iy >= 40 {
+            return g;
+        }
+    }
+    let p = mons[0].position();
+    let s = mons[0].size();
+    Geom {
+        x: p.x + 40,
+        y: p.y + 60,
+        w: g.w.clamp(120, s.width.max(120)),
+        h: g.h.clamp(80, s.height.max(80)),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     init_settings();
@@ -443,14 +549,15 @@ pub fn run() {
             shelf_desk_items, plan_suggest, yaml_export, yaml_import,
             shelf_batches, shelf_undo_selected, dup_scan, dup_archive,
             shelf_save_url, todo_list, todo_add, todo_toggle, todo_del, music_open,
-            lunar_now, music_set
+            lunar_now, music_set, open_path, reveal_path, alpha_live
         ])
         .build(tauri::generate_context!())
         .expect("NestDesk 启动失败");
 
-    // 启动时恢复布局（layout.json 缺失/损坏则用 tauri.conf 默认位置）
+    // 启动时恢复布局（layout.json 缺失/损坏则用 tauri.conf 默认位置）；屏外坐标先钳制
     for (label, g) in load_layout() {
         if let Some(w) = app.get_webview_window(label.as_str()) {
+            let g = clamp_geom(app.handle(), g);
             let _ = w.set_position(Position::Physical(PhysicalPosition::new(g.x, g.y)));
             let _ = w.set_size(Size::Physical(PhysicalSize::new(g.w, g.h)));
         }
@@ -460,42 +567,52 @@ pub fn run() {
     let handle = app.handle().clone();
     std::thread::spawn(move || {
         let mut last: HashMap<String, Geom> = HashMap::new();
+        let mut applied_alpha: HashMap<String, u8> = HashMap::new();
         let mut dirty_since: Option<std::time::Instant> = None;
         loop {
             std::thread::sleep(Duration::from_millis(2000));
             let mut changed = false;
             let pin = std::env::var_os("NESTDESK_NOPIN").is_none();
-            for w in surfaces(&handle) {
+            for w in layout_windows(&handle) {
+                let is_surface = SURFACES.contains(&w.label());
                 if let Ok(h) = w.hwnd() {
                     unsafe {
                         let ptr = h.0 as *mut std::ffi::c_void;
-                        if pin {
+                        if pin && is_surface {
                             use std::sync::{LazyLock, Mutex};
                             use std::collections::HashSet;
                             static STYLED: LazyLock<Mutex<HashSet<usize>>> =
                                 LazyLock::new(|| Mutex::new(HashSet::new()));
                             let addr = ptr as usize;
-                            let mut set = STYLED.lock().unwrap();
-                            if !set.contains(&addr) {
+                            let mut set = STYLED.lock().unwrap_or_else(|e| e.into_inner());
+                            // 清理已销毁窗口的死条目（HWND 地址复用误判的根源）
+                            set.retain(|a| layer::is_window(*a as *mut std::ffi::c_void));
+                            let fresh = !set.contains(&addr);
+                            if fresh {
                                 layer::ensure_layered(ptr);
                                 layer::style_surface(ptr);
                                 set.insert(addr);
                             }
                             drop(set);
-                            // 透明度实时跟随控制台设置（只改 LWA_ALPHA，不动扩展样式）
+                            // 透明度：设置值/句柄未变就不再下发（避免每 2s 触发 DWM 重合成）
                             let alpha = current_settings()
                                 .alpha
                                 .get(w.label())
                                 .copied()
                                 .unwrap_or(250)
                                 .clamp(30, 255) as u8;
-                            layer::set_alpha(ptr, alpha);
-                            layer::pin_bottom(ptr);
+                            let key = format!("{}@{addr}", w.label());
+                            if fresh || applied_alpha.get(&key) != Some(&alpha) {
+                                layer::set_alpha(ptr, alpha);
+                                applied_alpha.insert(key, alpha);
+                            }
+                            // Z 序：仅 Win+D 最小化或已不在最底时才重钉
+                            layer::repin_if_needed(ptr);
                         }
                     }
                 }
                 if let (Ok(pos), Ok(size)) = (w.outer_position(), w.inner_size()) {
-                    let g = Geom { x: pos.x, y: pos.y, w: size.width, h: size.height };
+                    let g = clamp_geom(&handle, Geom { x: pos.x, y: pos.y, w: size.width, h: size.height });
                     if last.get(w.label()) != Some(&g) {
                         last.insert(w.label().to_string(), g);
                         changed = true;
@@ -517,7 +634,12 @@ pub fn run() {
 }
 
 // ---------- --demo：真实桌面全链路（收取→分格→复原），JSON 证据输出后退出 ----------
+#[cfg(any(debug_assertions, feature = "harness"))]
 pub fn demo_run() {
+    if std::env::var_os("NESTDESK_DEMO").is_none() {
+        eprintln!("refusing --demo: it moves REAL desktop files. Set NESTDESK_DEMO=1 to confirm.");
+        std::process::exit(2);
+    }
     init_settings();
     let cfg = real_cfg();
     let before = fs_core::snapshot(&cfg);
@@ -551,7 +673,24 @@ pub fn demo_run() {
 }
 
 // ---------- selftest：--selftest 全离线自测（A3/A4 自动化版，不碰真实桌面） ----------
+#[cfg(any(debug_assertions, feature = "harness"))]
 pub fn selftest() {
+    // 兜底：任何断言/写盘 panic 也要产出结构化 JSON（CI 门禁不能只看到裸 panic）
+    let outcome = std::panic::catch_unwind(selftest_body);
+    match outcome {
+        Ok(()) => {}
+        Err(e) => {
+            let msg = e.downcast_ref::<&str>().map(|s| s.to_string())
+                .or_else(|| e.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panic".into());
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({"pass": false, "panic": msg})).unwrap());
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(any(debug_assertions, feature = "harness"))]
+fn selftest_body() {
     use std::collections::HashSet;
     let root = std::env::temp_dir().join(format!("nestdesk-selftest-{}", fs_core::now_ms()));
     let desktop = root.join("Desktop");
@@ -643,8 +782,10 @@ pub fn selftest() {
         format!("paper={n_paper} data={n_data}"));
 
     // 删除一个已归档文件 → undo 计 missing 不崩
-    let victim = ents[0].new.clone();
-    let _ = fs::remove_file(&victim);
+    if let Some(first) = ents.first() {
+        let victim = first.new.clone();
+        let _ = fs::remove_file(&victim);
+    }
 
     let rep = fs_core::undo_all(&cfg);
     let mut found: HashSet<Vec<u8>> = HashSet::new();
@@ -717,7 +858,43 @@ pub fn selftest() {
     report("查重: 3份相同→组成 1 组·1 几何，归档可复原", sets.len() == 1 && mov.moved.len() == 2 && moved_back_ok,
         format!("sets={} moved={}", sets.len(), mov.moved.len()));
 
+    // v0.5 回归 1：URL 下载条目 undo = 撤销下载（删除落点），不混入 missing
+    let urlfile = cfg2.inbox_root.join("图片").join("downloaded.png");
+    let _ = fs::create_dir_all(urlfile.parent().unwrap());
+    fs::write(&urlfile, b"PNG").unwrap();
+    let url_entry = serde_json::json!({
+        "batch": "url-test", "old": "@url|https://example.com/a.png",
+        "new": urlfile.to_string_lossy(), "ts": fs_core::now_ms()
+    });
+    let mut jbody = fs::read_to_string(&cfg2.journal).unwrap_or_default();
+    jbody.push_str(&format!("{}\n", url_entry));
+    fs::write(&cfg2.journal, jbody).unwrap();
+    let ru = fs_core::undo_all(&cfg2);
+    report("URL 下载: undo 撤销下载（删除落点）而非报 missing",
+        ru.restored == 1 && !urlfile.exists() && ru.missing.is_empty(), format!("{ru:?}"));
+
+    // v0.5 回归 2：YAML 导出→导入严格往返 + 路径穿越组名被拒
+    let src_groups = vec![
+        ("文档".to_string(), vec!["docx".to_string(), "pdf".to_string()]),
+        ("图片".to_string(), vec!["png".to_string()]),
+    ];
+    let y = fs_core::export_yaml(&src_groups);
+    let back = fs_core::import_yaml(&y).unwrap_or_default();
+    report("YAML: 导出→导入严格往返", back == src_groups, format!("{back:?}"));
+    let evil = fs_core::import_yaml("groups:\n  - name: ../../outside\n    exts: [zip]\n");
+    report("YAML: 路径穿越组名被拒绝", evil.is_err(), format!("{evil:?}"));
+
+    // v0.5 回归 3：事务批次的 groups 是真实组名（不再恒为「归档」）
+    let gfile = sub.join("pic.png");
+    fs::write(&gfile, b"p").unwrap();
+    fs_core::ingest(&cfg2, vec![gfile.to_string_lossy().to_string()]);
+    let bb = fs_core::list_batches(&cfg2);
+    let grp_ok = bb.iter().any(|b| b.groups.iter().any(|(g, _)| g == "图片"));
+    report("事务: 批次分组显示真实组名", grp_ok, format!("{:?}", bb.first().map(|b| &b.groups)));
+
     let pass = checks.iter().all(|c| c["ok"].as_bool().unwrap_or(false));
     println!("{}", serde_json::to_string_pretty(&serde_json::json!({"pass": pass, "checks": checks, "root": root})).unwrap());
+    // 不留垃圾：每次自检的临时目录随手清掉（历史累积过 24 个孤儿目录）
+    let _ = fs::remove_dir_all(&root);
     std::process::exit(if pass { 0 } else { 1 });
 }

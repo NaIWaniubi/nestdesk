@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-todo-toggle"
+description = "Enables the todo_toggle command without any pre-configured scope."
+commands.allow = ["todo_toggle"]
+
+[[permission]]
+identifier = "deny-todo-toggle"
+description = "Denies the todo_toggle command without any pre-configured scope."
+commands.deny = ["todo_toggle"]

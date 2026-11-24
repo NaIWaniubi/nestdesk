@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "panel-todo",
+  "description": "待办：增删改/皮肤",
+  "windows": ["todo"],
+  "permissions": [
+    "core:default",
+    "allow-todo-list",
+    "allow-todo-add",
+    "allow-todo-toggle",
+    "allow-todo-del",
+    "allow-theme-get",
+    "allow-theme-set"
+  ]
+}
