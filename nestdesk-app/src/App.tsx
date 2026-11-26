@@ -2,9 +2,10 @@ import { useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { invoke } from "@tauri-apps/api/core";
+import { squarify, extColor } from "./treemap";
 
 // ---------- 皮肤 ----------
-const THEMES = ["night", "sunset", "contrast", "mist"] as const;
+const THEMES = ["night", "aurora", "cyber", "sunset", "contrast", "mist"] as const;
 type Theme = (typeof THEMES)[number];
 
 function useTheme(): [Theme, () => void] {
@@ -68,17 +69,74 @@ function Clock() {
   );
 }
 
-// ---------- 系统监视 ----------
+// ---------- 系统监视（v0.7：btop/bottom 范式 — 时序曲线 + 环形磁盘） ----------
 interface SysInfo {
   cpu: number; mem_total: number; mem_used: number;
   battery: { percent: number; ac: boolean; charging: boolean } | null;
+  disk: { drive: string; total: number; free: number; used: number; pct: number } | null;
 }
+
+/// 60 点历史 → SVG sparkline（渐变填充 + 发光描边）
+function Spark({ data, color, max = 100 }: { data: number[]; color: string; max?: number }) {
+  const W = 100, H = 26;
+  if (data.length < 2) return <div style={{ height: H }} />;
+  const step = W / Math.max(data.length - 1, 1);
+  const pts = data.map((v, i) => `${(i * step).toFixed(2)},${(H - Math.min(v, max) / max * (H - 2) - 1).toFixed(2)}`);
+  const line = `M${pts.join(" L")}`;
+  const area = `${line} L${W},${H} L0,${H} Z`;
+  const gid = `g${color.replace(/[^a-z0-9]/gi, "")}${data.length}`;
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ width: "100%", height: H, display: "block", overflow: "visible" }}>
+      <defs>
+        <linearGradient id={gid} x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor={color} stopOpacity="0.55" />
+          <stop offset="100%" stopColor={color} stopOpacity="0.02" />
+        </linearGradient>
+      </defs>
+      <path d={area} fill={`url(#${gid})`} />
+      <path d={line} fill="none" stroke={color} strokeWidth="1.2" strokeLinejoin="round" vectorEffect="non-scaling-stroke"
+        style={{ filter: `drop-shadow(0 0 2px ${color})` }} />
+    </svg>
+  );
+}
+
+/// 环形进度（用于磁盘 / 电池）
+function Ring({ pct, label, sub, color }: { pct: number; label: string; sub: string; color: string }) {
+  const r = 16, c = 2 * Math.PI * r;
+  const v = Math.max(0, Math.min(100, pct));
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+      <svg width="42" height="42" viewBox="0 0 42 42" style={{ flex: "none" }}>
+        <circle cx="21" cy="21" r={r} fill="none" stroke="var(--bar-bg)" strokeWidth="4" />
+        <circle cx="21" cy="21" r={r} fill="none" stroke={color} strokeWidth="4" strokeLinecap="round"
+          strokeDasharray={`${(v / 100) * c} ${c}`} transform="rotate(-90 21 21)"
+          style={{ transition: "stroke-dasharray .6s ease-out", filter: `drop-shadow(0 0 3px ${color})` }} />
+        <text x="21" y="24" textAnchor="middle" style={{ fontSize: 9, fill: "var(--text)", fontWeight: 600 }}>{Math.round(v)}</text>
+      </svg>
+      <div style={{ minWidth: 0 }}>
+        <div style={{ fontSize: 11, color: "var(--text)" }}>{label}</div>
+        <div style={{ fontSize: 9, color: "var(--dim)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{sub}</div>
+      </div>
+    </div>
+  );
+}
+
 function Sysmon() {
   const [info, setInfo] = useState<SysInfo | null>(null);
+  const [cpuHist, setCpuHist] = useState<number[]>([]);
+  const [memHist, setMemHist] = useState<number[]>([]);
   const [, cycle] = useTheme();
   useEffect(() => {
     let alive = true;
-    const tick = () => invoke<SysInfo>("get_sysinfo").then((s) => alive && setInfo(s)).catch(() => {});
+    const tick = () => invoke<SysInfo>("get_sysinfo").then((s) => {
+      if (!alive) return;
+      setInfo(s);
+      // 前端保留 60 点（2s × 60 = 2 分钟趋势），后端不存历史
+      const cpu = s.cpu >= 0 ? s.cpu * 100 : 0;
+      const mem = s.mem_total ? (s.mem_used / s.mem_total) * 100 : 0;
+      setCpuHist((h) => [...h, cpu].slice(-60));
+      setMemHist((h) => [...h, mem].slice(-60));
+    }).catch(() => {});
     tick();
     const t = setInterval(tick, 2000);
     return () => { alive = false; clearInterval(t); };
@@ -86,24 +144,31 @@ function Sysmon() {
   const cpu = info && info.cpu >= 0 ? Math.round(info.cpu * 100) : 0;
   const mem = info && info.mem_total ? Math.round((info.mem_used / info.mem_total) * 100) : 0;
   const bat = info?.battery;
+  const dsk = info?.disk;
+  const cpuColor = cpu > 85 ? "#f97362" : cpu > 60 ? "#f5a524" : "var(--accent)";
+  const memColor = mem > 88 ? "#f97362" : mem > 70 ? "#f5a524" : "#56c596";
   return (
     <div className="card grab">
       <div className="head"><b>系统</b><span className="sp" />
         <span className="badge nodrag" onClick={cycle} title="换肤">◐</span>
       </div>
-      <div className="mon-rows">
+      <div className="mon-rows" style={{ gap: 7 }}>
         <div className="mon-row">
-          <div className="lbl"><span>CPU</span><span>{cpu}%</span></div>
-          <div className="bar"><i style={{ width: `${cpu}%` }} /></div>
+          <div className="lbl"><span>CPU</span><span style={{ color: cpuColor }}>{cpu}%</span></div>
+          <Spark data={cpuHist} color={cpuColor} />
         </div>
         <div className="mon-row">
-          <div className="lbl"><span>内存</span><span>{info ? fmtBytes(info.mem_used) : "--"}</span></div>
-          <div className="bar"><i style={{ width: `${mem}%` }} /></div>
+          <div className="lbl"><span>内存</span><span style={{ color: memColor }}>{info ? fmtBytes(info.mem_used) : "--"} · {mem}%</span></div>
+          <Spark data={memHist} color={memColor} />
         </div>
-        <div className="chip">
-          {bat === null || bat === undefined
-            ? "🖥️ 台式机 · " + (info ? `${fmtBytes(info.mem_total)} RAM` : "")
-            : `${bat.ac ? "🔌 插电" : "🔋 电池"}${bat.charging && bat.percent < 100 ? " · 充电中" : ""} · ${bat.percent}%`}
+        <div style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 2 }}>
+          {dsk && <Ring pct={dsk.pct} color={dsk.pct > 90 ? "#f97362" : "var(--accent)"}
+            label={`${dsk.drive} 磁盘`} sub={`剩 ${fmtBytes(dsk.free)} / ${fmtBytes(dsk.total)}`} />}
+          {bat && <Ring pct={bat.percent} color={bat.charging ? "#56c596" : bat.percent < 20 ? "#f97362" : "#f5a524"}
+            label={bat.charging ? "充电中" : bat.ac ? "已插电" : "电池"} sub={`${bat.percent}%`} />}
+        </div>
+        <div className="chip" style={{ fontSize: 9, paddingTop: 0 }}>
+          {info ? `${fmtBytes(info.mem_total)} RAM` : ""}{bat ? "" : " · 台式机"}
         </div>
       </div>
     </div>
@@ -299,7 +364,7 @@ interface SuggestPlanT {
 }
 
 function Settings() {
-  type Tab = "桌面" | "归纳" | "事务" | "查重" | "雷达" | "更多";
+  type Tab = "桌面" | "归纳" | "事务" | "查重" | "雷达" | "空间" | "更多";
   const [tab, setTab] = useState<Tab>("桌面");
   const [groups, setGroups] = useState<GroupRule[]>([]);
   const [alpha, setAlpha] = useState<Record<string, number>>({});
@@ -409,6 +474,44 @@ function Settings() {
     setSaved(await invoke<string>("music_set", { path: player.trim() }));
   };
 
+  // ---- v0.7 磁盘空间（WinDirStat 范式）----
+  interface DiskNodeT { name: string; path: string; is_dir: boolean; size: number; files: number; pct: number; ext: string }
+  interface DiskScanT { root: string; total: number; total_files: number; children: DiskNodeT[]; ext_stats: { ext: string; size: number; count: number; pct: number }[]; truncated: boolean; elapsed_ms: number; skipped_dirs: number }
+  interface DriveT { drive: string; total: number; free: number; used: number; pct: number }
+  const [ds, setDs] = useState<DiskScanT | null>(null);
+  const [dpath, setDpath] = useState<string>("");
+  const [droot, setDRoot] = useState<string>("");
+  const [trail, setTrail] = useState<{ name: string; path: string }[]>([]);
+  const [dsel, setDSel] = useState<DiskNodeT | null>(null);
+  const [extFilter, setExtFilter] = useState<string>("");
+  const [drives, setDrives] = useState<DriveT[]>([]);
+  useEffect(() => {
+    invoke<string>("disk_root").then((r) => { setDRoot(r); setDpath(r); }).catch(() => {});
+    invoke<DriveT[]>("disk_drives").then(setDrives).catch(() => {});
+  }, []);
+  const scanDisk = async (p?: string) => {
+    const target = p ?? dpath ?? droot;
+    if (!target) return;
+    setBusy(true);
+    try {
+      const r = await invoke<DiskScanT>("disk_scan", { path: target });
+      setDs(r); setDpath(r.root); setDSel(null);
+    } catch (e) { setMsg(`扫描失败：${String(e).slice(0, 120)}`); }
+    finally { setBusy(false); }
+  };
+  useEffect(() => { if (droot) scanDisk(droot); }, [droot]);
+  const drill = async (n: DiskNodeT) => {
+    if (!n.is_dir) { setDSel(n); return; }
+    setTrail((t) => [...t, { name: n.name, path: n.path }]);
+    await scanDisk(n.path);
+  };
+  const goUp = async (idx: number) => {
+    // idx = -1 表示回到根
+    const next = idx < 0 ? droot : trail[idx].path;
+    setTrail((t) => t.slice(0, idx + 1));
+    await scanDisk(next);
+  };
+
   // ---- v0.6 桌面监听 ----
   const [watch, setWatch] = useState(false);
   const [watchStat, setWatchStat] = useState<{ enabled: boolean; last_tick: number; last_moved: number }>({ enabled: false, last_tick: 0, last_moved: 0 });
@@ -475,7 +578,7 @@ function Settings() {
 
   const tabs: { k: Tab; label: string }[] = [
     { k: "桌面", label: "桌面" }, { k: "归纳", label: "归纳" }, { k: "事务", label: "事务" },
-    { k: "查重", label: "查重" }, { k: "雷达", label: "雷达" }, { k: "更多", label: "更多" },
+    { k: "查重", label: "查重" }, { k: "雷达", label: "雷达" }, { k: "空间", label: "空间" }, { k: "更多", label: "更多" },
   ];
   const updateExts = (i: number, raw: string) => setGroups((gs) => gs.map((g, j) => (j === i ? { ...g, exts: raw.split(/[,，\s]+/).map((e) => e.trim().toLowerCase()).filter(Boolean) } : g)));
 
@@ -646,6 +749,118 @@ function Settings() {
           </>
         )}
 
+        {tab === "空间" && (() => {
+          const items = (ds?.children ?? []).filter((c) => !extFilter || c.ext === extFilter || (c.is_dir && !extFilter));
+          const rects = squarify(items.map((c) => ({ key: c.path, weight: c.size })), 600, 260);
+          const byPath = new Map(items.map((c) => [c.path, c]));
+          return (
+            <>
+              <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 6, flexWrap: "wrap" }}>
+                <span className="btn nodrag" onClick={() => scanDisk(dpath)}>{busy ? "扫描中…" : "⟳ 重新扫描"}</span>
+                <span style={{ fontSize: 10, color: "var(--dim)" }}>
+                  {ds ? `${ds.total_files} 文件 · ${fmtBytes(ds.total)}${ds.truncated ? " · 已截断" : ""} · ${ds.elapsed_ms}ms${ds.skipped_dirs ? ` · 跳过 ${ds.skipped_dirs} 个噪音目录` : ""}` : "尚未扫描"}
+                </span>
+              </div>
+              <div style={{ display: "flex", gap: 4, alignItems: "center", fontSize: 10, marginBottom: 6, flexWrap: "wrap" }}>
+                <span className="btn nodrag" style={{ fontSize: 10, padding: "2px 7px" }} onClick={() => goUp(-1)}>📦 收件箱</span>
+                {trail.map((t, i) => (
+                  <span key={t.path} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    <span style={{ color: "var(--dim)" }}>›</span>
+                    <span className="btn nodrag" style={{ fontSize: 10, padding: "2px 7px" }} onClick={() => goUp(i)}>{t.name}</span>
+                  </span>
+                ))}
+                {extFilter && <span className="btn nodrag" style={{ fontSize: 10, padding: "2px 7px", color: "var(--accent)" }} onClick={() => setExtFilter("")}>过滤：.{extFilter} ✕</span>}
+              </div>
+
+              {items.length === 0 && <div style={{ fontSize: 11, color: "var(--dim)" }}>{ds ? "这个目录是空的（或全部被截断/跳过）" : "载入中…"}</div>}
+
+              {items.length > 0 && (
+                <div style={{ position: "relative", width: "100%", paddingBottom: "43%", borderRadius: 10, overflow: "hidden", border: "1px solid var(--border)", background: "var(--bar-bg)" }}>
+                  <div style={{ position: "absolute", inset: 0 }}>
+                    {rects.map((r) => {
+                      const n = byPath.get(r.key);
+                      if (!n) return null;
+                      const w = r.w / 600 * 100, h = r.h / 260 * 100;
+                      const color = extColor(n.ext);
+                      const showLabel = w > 12 && h > 14;
+                      return (
+                        <div key={r.key}
+                          onClick={() => drill(n)}
+                          title={`${n.path}\n${fmtBytes(n.size)} · ${n.pct.toFixed(1)}%${n.is_dir ? ` · ${n.files} 个文件` : ""}`}
+                          style={{
+                            position: "absolute",
+                            left: `${(r.x / 600) * 100}%`, top: `${(r.y / 260) * 100}%`,
+                            width: `calc(${w}% - 2px)`, height: `calc(${h}% - 2px)`,
+                            // 目录略微压暗以区分于同名文件，但仍继承主导类型色
+                            background: n.is_dir
+                              ? `linear-gradient(135deg, ${color}ee, ${color}77)`
+                              : `linear-gradient(135deg, ${color}dd, ${color}88)`,
+                            borderRadius: 3, cursor: "pointer", overflow: "hidden",
+                            boxShadow: n.is_dir
+                              ? "inset 0 0 0 1px rgba(255,255,255,.16), inset 0 -10px 18px -8px rgba(0,0,0,.45)"
+                              : "inset 0 0 0 1px rgba(255,255,255,.12)",
+                            transition: "filter .15s, transform .15s",
+                          }}
+                          onMouseEnter={(e) => { (e.currentTarget as HTMLDivElement).style.filter = "brightness(1.35)"; }}
+                          onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.filter = ""; }}
+                        >
+                          {showLabel && (
+                            <div style={{ fontSize: 9, color: "#fff", padding: "2px 3px", lineHeight: 1.2, textShadow: "0 1px 2px rgba(0,0,0,.8)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                              {n.is_dir ? "📁 " : ""}{n.name}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {dsel && (
+                <div style={{ marginTop: 8, fontSize: 10, border: "1px solid var(--border)", borderRadius: 8, padding: "6px 8px" }}>
+                  <div style={{ color: "var(--accent)", wordBreak: "break-all" }}>{dsel.path}</div>
+                  <div style={{ color: "var(--dim)", marginTop: 2 }}>{fmtBytes(dsel.size)} · {dsel.pct.toFixed(1)}%{dsel.ext ? ` · .${dsel.ext}` : ""}</div>
+                </div>
+              )}
+
+              {ds && ds.ext_stats.length > 0 && (
+                <>
+                  <div style={{ fontSize: 11, color: "var(--dim)", margin: "10px 0 4px" }}>按类型（点击过滤）</div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                    {ds.ext_stats.map((e) => (
+                      <span key={e.ext} onClick={() => setExtFilter(extFilter === e.ext ? "" : e.ext)}
+                        style={{
+                          display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer",
+                          fontSize: 10, padding: "2px 7px", borderRadius: 8,
+                          border: `1px solid ${extFilter === e.ext ? extColor(e.ext) : "var(--border)"}`,
+                          background: extFilter === e.ext ? `${extColor(e.ext)}33` : "transparent",
+                        }}>
+                        <i style={{ width: 7, height: 7, borderRadius: 2, background: extColor(e.ext), display: "inline-block" }} />
+                        {e.ext} · {fmtBytes(e.size)} · {e.count}
+                      </span>
+                    ))}
+                  </div>
+                </>
+              )}
+
+              {drives.length > 0 && (
+                <>
+                  <div style={{ fontSize: 11, color: "var(--dim)", margin: "10px 0 4px" }}>磁盘容量</div>
+                  {drives.map((d) => (
+                    <div key={d.drive} style={{ marginBottom: 5 }}>
+                      <div className="lbl" style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "var(--dim)" }}>
+                        <span>{d.drive}</span>
+                        <span style={{ color: "var(--text)" }}>{fmtBytes(d.used)} / {fmtBytes(d.total)} · {d.pct.toFixed(0)}%</span>
+                      </div>
+                      <div className="bar"><i style={{ width: `${d.pct}%` }} /></div>
+                    </div>
+                  ))}
+                </>
+              )}
+            </>
+          );
+        })()}
+
         {tab === "更多" && (
           <>
             <div style={{ fontSize: 12, color: "var(--dim)", margin: "4px 0 8px" }}>面板透明度（实时生效）</div>
@@ -686,9 +901,9 @@ function Settings() {
             <div style={{ fontSize: 10, color: "var(--dim)", marginTop: 4 }}>留空则用系统默认；推荐 Folia（github.com/chthollyphile/folia-major，AGPL）。</div>
 
             <div style={{ display: "flex", gap: 8 }}>
-              {(["night", "sunset", "contrast", "mist"] as const).map((t) => (
-                <span key={t} className="btn nodrag" onClick={() => { document.documentElement.dataset.theme = t; invoke("theme_set", { theme: t }); setSaved(`皮肤：${({ night: "夜航", sunset: "落日晚霞", contrast: "高对比", mist: "雨雾" } as Record<string, string>)[t]}`); }}>
-                  {({ night: "夜航", sunset: "落日晚霞", contrast: "高对比", mist: "雨雾" } as Record<string, string>)[t]}
+              {(["night", "aurora", "cyber", "sunset", "contrast", "mist"] as const).map((t) => (
+                <span key={t} className="btn nodrag" onClick={() => { document.documentElement.dataset.theme = t; invoke("theme_set", { theme: t }); setSaved(`皮肤：${({ night: "夜航", aurora: "极光", cyber: "赛博", sunset: "落日晚霞", contrast: "高对比", mist: "雨雾" } as Record<string, string>)[t]}`); }}>
+                  {({ night: "夜航", aurora: "极光", cyber: "赛博", sunset: "落日晚霞", contrast: "高对比", mist: "雨雾" } as Record<string, string>)[t]}
                 </span>
               ))}
             </div>
@@ -787,7 +1002,17 @@ function Radar() {
   );
 }
 
+function useApplyThemeOnce() {
+  // 每个窗口（含控制台）都必须有 data-theme，否则所有主题色变量都是 undefined。
+  useEffect(() => {
+    invoke<string>("theme_get").then((t) => {
+      document.documentElement.dataset.theme = THEMES.includes(t as Theme) ? t : "night";
+    }).catch(() => { document.documentElement.dataset.theme = "night"; });
+  }, []);
+}
+
 export default function App() {
+  useApplyThemeOnce();
   const label = getCurrentWindow().label;
   if (label === "shelf") return <Shelf />;
   if (label === "clock") return <Clock />;

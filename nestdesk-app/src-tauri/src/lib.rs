@@ -2,6 +2,7 @@
 mod fs_core;
 mod layer;
 mod radar;
+mod disk;
 
 use fs_core::{Config, DeskItem, DupSet, IngestResult, Snapshot, SuggestPlan, UndoReport};
 use std::process::Command;
@@ -231,7 +232,14 @@ fn alpha_live(label: String, alpha: u32) {
 #[derive(Serialize)]
 struct Battery { percent: u8, ac: bool, charging: bool }
 #[derive(Serialize)]
-struct SysInfo { cpu: f64, mem_total: u64, mem_used: u64, battery: Option<Battery> }
+struct SysInfo {
+    cpu: f64,
+    mem_total: u64,
+    mem_used: u64,
+    battery: Option<Battery>,
+    /// 系统盘（用户桌面所在卷）容量，v0.7
+    disk: Option<disk::DriveSpace>,
+}
 
 #[tauri::command]
 fn get_sysinfo() -> SysInfo {
@@ -241,6 +249,7 @@ fn get_sysinfo() -> SysInfo {
         mem_total,
         mem_used: mem_total.saturating_sub(mem_avail),
         battery: layer::battery().map(|(p, ac, ch)| Battery { percent: p, ac, charging: ch }),
+        disk: disk::drive_space_of(&desktop_dir()),
     }
 }
 
@@ -452,6 +461,29 @@ fn shelf_save_url(url: String) -> IngestResult {
     let s = current_settings();
     let groups: Vec<(String, Vec<String>)> = s.groups.iter().map(|g| (g.name.clone(), g.exts.clone())).collect();
     fs_core::save_url(&real_cfg(), &groups, &url)
+}
+
+// ---------- v0.7 磁盘空间可视化 ----------
+#[tauri::command]
+fn disk_scan(path: Option<String>) -> disk::DiskScan {
+    init_settings();
+    // 默认扫收件箱（NestDesk 自己的地盘）；也可传任意路径下钻
+    let root = path
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| real_cfg().inbox_root);
+    disk::scan_dir(&root, 120_000, 5_000)
+}
+
+#[tauri::command]
+fn disk_drives() -> Vec<disk::DriveSpace> {
+    disk::list_drives().into_iter()
+        .filter_map(|d| disk::drive_space_of(std::path::Path::new(&d)))
+        .collect()
+}
+
+#[tauri::command]
+fn disk_root() -> String {
+    real_cfg().inbox_root.to_string_lossy().to_string()
 }
 
 // ---------- v0.6 资讯雷达 ----------
@@ -781,7 +813,8 @@ pub fn run() {
             shelf_save_url, todo_list, todo_add, todo_toggle, todo_del, music_open,
             lunar_now, music_set, open_path, reveal_path, alpha_live,
             watcher_get, watcher_set, watcher_status, surfaces_toggle, surfaces_state,
-            radar_cfg, radar_set, radar_items, radar_refresh, radar_builtin, radar_clear, radar_to_todo
+            radar_cfg, radar_set, radar_items, radar_refresh, radar_builtin, radar_clear, radar_to_todo,
+            disk_scan, disk_drives, disk_root
         ])
         .setup(|app| {
             build_tray(app.handle())?;
@@ -1264,6 +1297,24 @@ fn selftest_body() {
     let healed = radar::load_store(&rp);
     report("雷达: 存储落盘 + 主文件损坏走 .bak 自愈",
         loaded.items.len() == 1 && healed.items.len() == 1, format!("loaded={} healed={}", loaded.items.len(), healed.items.len()));
+
+    // v0.7 回归：磁盘扫描（大小/文件数/扩展名聚合/噪音目录）
+    let dbox = root.join("diskbox");
+    let _ = fs::create_dir_all(dbox.join("sub"));
+    let _ = fs::create_dir_all(dbox.join("node_modules/pkg"));
+    fs::write(dbox.join("a.txt"), vec![b'x'; 100]).unwrap();
+    fs::write(dbox.join("b.log"), vec![b'y'; 200]).unwrap();
+    fs::write(dbox.join("sub/c.txt"), vec![b'z'; 300]).unwrap();
+    fs::write(dbox.join("node_modules/pkg/ignored.js"), vec![b'w'; 9999]).unwrap();
+    let dscan = disk::scan_dir(&dbox, 100_000, 5_000);
+    let txt = dscan.ext_stats.iter().find(|e| e.ext == "txt").map(|e| (e.size, e.count));
+    report("空间: 扫描总大小/文件数/扩展名聚合/跳过 node_modules",
+        dscan.total == 600 && dscan.total_files == 3 && txt == Some((400, 2)) && dscan.skipped_dirs == 1,
+        format!("total={} files={} txt={:?} skipped={}", dscan.total, dscan.total_files, txt, dscan.skipped_dirs));
+    let drive = disk::drive_space_of(&dbox);
+    report("空间: 盘符容量可读且 used+free=total",
+        drive.as_ref().map(|d| d.total > 0 && d.used + d.free == d.total).unwrap_or(false),
+        format!("{:?}", drive.map(|d| (d.drive, d.total, d.free, d.pct as u64))));
 
     let pass = checks.iter().all(|c| c["ok"].as_bool().unwrap_or(false));
     println!("{}", serde_json::to_string_pretty(&serde_json::json!({"pass": pass, "checks": checks, "root": root})).unwrap());

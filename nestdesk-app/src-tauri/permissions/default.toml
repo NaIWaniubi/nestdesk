@@ -46,4 +46,7 @@ permissions = [
   "allow-radar-builtin",
   "allow-radar-clear",
   "allow-radar-to-todo",
+  "allow-disk-scan",
+  "allow-disk-drives",
+  "allow-disk-root",
 ]

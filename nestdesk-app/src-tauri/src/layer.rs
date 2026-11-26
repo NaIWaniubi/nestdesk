@@ -62,6 +62,7 @@ unsafe extern "system" {
     fn GetSystemTimes(idle: *mut FileTimeT, kernel: *mut FileTimeT, user: *mut FileTimeT) -> i32;
     fn GlobalMemoryStatusEx(buf: *mut MemoryStatusEx) -> i32;
     fn GetSystemPowerStatus(sps: *mut SystemPowerStatus) -> i32;
+    fn GetDiskFreeSpaceExW(dir: *const u16, free_to_caller: *mut u64, total: *mut u64, total_free: *mut u64) -> i32;
 }
 
 #[link(name = "dwmapi")]
@@ -157,6 +158,26 @@ pub fn cpu_usage() -> f64 {
         };
         *g = Some((i, k, u));
         r.clamp(0.0, 1.0)
+    }
+}
+
+/// 路径所在卷的容量：(总容量, 可用容量) 字节。
+/// 用 GetDiskFreeSpaceExW 而不是 GetDiskFreeSpaceW：前者返回 64 位、支持 >2TB 卷与 UNC。
+pub fn disk_free(path: &std::path::Path) -> Option<(u64, u64)> {
+    unsafe {
+        // 取盘符根（"E:\\"）：API 要求目录路径，子目录同样接受，用根更稳
+        let root = path.components().next()
+            .map(|c| c.as_os_str().to_string_lossy().to_string())
+            .filter(|s| s.len() >= 2)
+            .unwrap_or_else(|| "C:\\".to_string());
+        let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut free_to_caller: u64 = 0;
+        let mut total: u64 = 0;
+        let mut total_free: u64 = 0;
+        if GetDiskFreeSpaceExW(wide.as_ptr(), &mut free_to_caller, &mut total, &mut total_free) == 0 {
+            return None;
+        }
+        Some((total, free_to_caller))
     }
 }
 

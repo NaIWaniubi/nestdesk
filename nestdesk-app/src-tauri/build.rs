@@ -46,6 +46,9 @@ fn main() {
             "radar_builtin",
             "radar_clear",
             "radar_to_todo",
+            "disk_scan",
+            "disk_drives",
+            "disk_root",
         ])),
     )
     .expect("failed to run tauri-build");
