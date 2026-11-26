@@ -270,7 +270,7 @@ fn theme_get() -> String {
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .and_then(|v| v.get("theme").and_then(|t| t.as_str()).map(String::from))
-        .unwrap_or_else(|| "night".into())
+        .unwrap_or_else(|| "glass".into())
 }
 #[tauri::command]
 fn theme_set(theme: String) {

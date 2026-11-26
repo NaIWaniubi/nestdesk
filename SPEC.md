@@ -102,6 +102,11 @@
   监视：CPU/内存 60 点 sparkline、磁盘/电池环形（GetDiskFreeSpaceExW）、负载变色。
   视觉：新增极光/赛博皮肤，卡片内发光与玻璃分层；修复控制台从不应用 data-theme 的缺陷。
   **selftest 28/28**、disk 单测 3/3；真机 treemap 面积 55.6%/44.4% 与体积一致。
+- ✅ v0.8（2026-11-26）：**液态玻璃材质**（参考 nikdelvin/liquid-glass 与 kubai087/glasswork 的技法，
+  未引入其代码）。tint/rim light/色散边/bevel/feTurbulence 噪点/指针镜面高光/liquid-drift 动效七层；
+  皮肤 6→8，液态玻璃设为默认；玻璃皮肤下按钮与进度条同步玻璃化。
+  像素验收：浅色 meanLum 233.2/sd 41.6、深色 158.6/sd 70.9；文字对比 ≈13:1。
+  边界：桌面分层窗口无法对壁纸做真实 backdrop 采样，故为「自足玻璃」而非折射实景。
 - ⏳ 待办：开机自启、年龄/大小规则、天气倒计时、剪贴板历史、右键菜单 shell 集成、AI 语义分类、归档周报、每核 CPU、网络速率。
 - ✅ v0.6（2026-11-26）：**桌面自动归档（opt-in）+ 托盘/全局快捷键 + 资讯雷达**。
   监听改为 `WatchState{baseline,pending}`：基线文件永不自动搬走（初版曾把 354 个历史文件全部搬走，

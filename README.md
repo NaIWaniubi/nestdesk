@@ -1,6 +1,29 @@
 # 归巢 NestDesk
 
-Windows 桌面分区收纳 + 改装小组件 + **一键复原**（自用 MVP v0.7）
+Windows 桌面分区收纳 + 改装小组件 + **一键复原**（自用 MVP v0.8）
+
+## v0.8 新增：液态玻璃材质（Liquid Glass）
+
+参考开源实现（只借技法不抄码）：
+- **nikdelvin/liquid-glass** — iOS 26 Liquid Glass 复刻：位移折射 + 色散（chromatic aberration）
+- **kubai087/glasswork** — 可拆解的玻璃材质：tint / blur / rim light / bevel / noise 分层参数化
+
+NestDesk 的实现（桌面分层窗口无法对壁纸做真实 backdrop 采样，故做「自足玻璃」）：
+| 层 | 做法 |
+|---|---|
+| 基底 tint | 双径向 + 线性渐变，浅色 `glass` / 深色 `glassdark` 两套，含青/品红双色散倾向 |
+| rim light | 顶部 1px 纯白高光 + 底部弱反光 |
+| 色散边 | 左右各 1px 青 / 品红内阴影（chromatic aberration 的低成本近似） |
+| bevel | 46px 内发光 + 外投影，制造厚度 |
+| 噪点 | 内联 SVG `feTurbulence`（fractalNoise）生成玻璃颗粒，`mix-blend-mode: overlay` |
+| 指针高光 | 指针位置写入 `--mx/--my`，径向高光跟随（实测 `::after` opacity 0.16） |
+| 液态动效 | `liquid-drift` 14s 缓慢漂移焦散；`prefers-reduced-motion` 自动关闭 |
+
+- 皮肤 6 → **8 套**，液态玻璃为**默认皮肤**（`theme_get` 缺省 = glass）
+- 玻璃皮肤下按钮/徽章/进度条/折叠组同步玻璃化（半透明 + 内高光 + 10px 背景模糊）
+- 像素验收：浅色玻璃 控制台 meanLum **233.2** / 亮度标准差 **41.6** / 37 色桶；
+  深色玻璃 meanLum **158.6** / sd **70.9** / 84 色桶（层次与颗粒均非纯色块）
+- 文字对比：浅色玻璃 #0c1a26 on ~233 亮度 ≈ 13:1，远超 WCAG AA
 
 ## v0.7 新增：磁盘空间可视化 + 炫酷系统监视 + 6 套皮肤
 

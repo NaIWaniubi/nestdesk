@@ -5,7 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { squarify, extColor } from "./treemap";
 
 // ---------- 皮肤 ----------
-const THEMES = ["night", "aurora", "cyber", "sunset", "contrast", "mist"] as const;
+const THEMES = ["glass", "glassdark", "night", "aurora", "cyber", "sunset", "contrast", "mist"] as const;
 type Theme = (typeof THEMES)[number];
 
 function useTheme(): [Theme, () => void] {
@@ -901,9 +901,9 @@ function Settings() {
             <div style={{ fontSize: 10, color: "var(--dim)", marginTop: 4 }}>留空则用系统默认；推荐 Folia（github.com/chthollyphile/folia-major，AGPL）。</div>
 
             <div style={{ display: "flex", gap: 8 }}>
-              {(["night", "aurora", "cyber", "sunset", "contrast", "mist"] as const).map((t) => (
-                <span key={t} className="btn nodrag" onClick={() => { document.documentElement.dataset.theme = t; invoke("theme_set", { theme: t }); setSaved(`皮肤：${({ night: "夜航", aurora: "极光", cyber: "赛博", sunset: "落日晚霞", contrast: "高对比", mist: "雨雾" } as Record<string, string>)[t]}`); }}>
-                  {({ night: "夜航", aurora: "极光", cyber: "赛博", sunset: "落日晚霞", contrast: "高对比", mist: "雨雾" } as Record<string, string>)[t]}
+              {(["glass", "glassdark", "night", "aurora", "cyber", "sunset", "contrast", "mist"] as const).map((t) => (
+                <span key={t} className="btn nodrag" onClick={() => { document.documentElement.dataset.theme = t; invoke("theme_set", { theme: t }); setSaved(`皮肤：${({ glass: "液态玻璃", glassdark: "深色玻璃", night: "夜航", aurora: "极光", cyber: "赛博", sunset: "落日晚霞", contrast: "高对比", mist: "雨雾" } as Record<string, string>)[t]}`); }}>
+                  {({ glass: "液态玻璃", glassdark: "深色玻璃", night: "夜航", aurora: "极光", cyber: "赛博", sunset: "落日晚霞", contrast: "高对比", mist: "雨雾" } as Record<string, string>)[t]}
                 </span>
               ))}
             </div>
@@ -1006,13 +1006,29 @@ function useApplyThemeOnce() {
   // 每个窗口（含控制台）都必须有 data-theme，否则所有主题色变量都是 undefined。
   useEffect(() => {
     invoke<string>("theme_get").then((t) => {
-      document.documentElement.dataset.theme = THEMES.includes(t as Theme) ? t : "night";
-    }).catch(() => { document.documentElement.dataset.theme = "night"; });
+      document.documentElement.dataset.theme = THEMES.includes(t as Theme) ? t : "glass";
+    }).catch(() => { document.documentElement.dataset.theme = "glass"; });
+  }, []);
+}
+
+/// 液态玻璃：指针位置驱动镜面高光（CSS 变量 --mx/--my）
+function useGlassPointer() {
+  useEffect(() => {
+    const onMove = (e: PointerEvent) => {
+      const el = (e.target as HTMLElement | null)?.closest?.(".card") as HTMLElement | null;
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      el.style.setProperty("--mx", `${e.clientX - r.left}px`);
+      el.style.setProperty("--my", `${e.clientY - r.top}px`);
+    };
+    window.addEventListener("pointermove", onMove, { passive: true });
+    return () => window.removeEventListener("pointermove", onMove);
   }, []);
 }
 
 export default function App() {
   useApplyThemeOnce();
+  useGlassPointer();
   const label = getCurrentWindow().label;
   if (label === "shelf") return <Shelf />;
   if (label === "clock") return <Clock />;
