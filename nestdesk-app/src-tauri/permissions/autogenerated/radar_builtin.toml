@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-radar-builtin"
+description = "Enables the radar_builtin command without any pre-configured scope."
+commands.allow = ["radar_builtin"]
+
+[[permission]]
+identifier = "deny-radar-builtin"
+description = "Denies the radar_builtin command without any pre-configured scope."
+commands.deny = ["radar_builtin"]

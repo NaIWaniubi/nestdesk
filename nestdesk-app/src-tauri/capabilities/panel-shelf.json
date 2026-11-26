@@ -14,6 +14,11 @@
     "allow-open-path",
     "allow-reveal-path",
     "allow-alpha-live",
+    "allow-watcher-get",
+    "allow-watcher-set",
+    "allow-watcher-status",
+    "allow-surfaces-toggle",
+    "allow-surfaces-state",
     "allow-theme-get",
     "allow-theme-set"
   ]

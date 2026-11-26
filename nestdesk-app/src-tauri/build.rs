@@ -34,6 +34,18 @@ fn main() {
             "open_path",
             "reveal_path",
             "alpha_live",
+            "watcher_get",
+            "watcher_set",
+            "watcher_status",
+            "surfaces_toggle",
+            "surfaces_state",
+            "radar_cfg",
+            "radar_set",
+            "radar_items",
+            "radar_refresh",
+            "radar_builtin",
+            "radar_clear",
+            "radar_to_todo",
         ])),
     )
     .expect("failed to run tauri-build");

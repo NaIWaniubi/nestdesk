@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "panel-radar",
+  "description": "资讯雷达卡片：只读列表",
+  "windows": ["radar"],
+  "permissions": ["core:default", "allow-radar-items", "allow-theme-get", "allow-theme-set"]
+}

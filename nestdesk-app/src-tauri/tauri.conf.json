@@ -82,6 +82,20 @@
         "focus": false
       },
       {
+        "label": "radar",
+        "title": "归巢 · 资讯雷达",
+        "width": 300,
+        "height": 260,
+        "x": 1180,
+        "y": 360,
+        "transparent": true,
+        "decorations": false,
+        "skipTaskbar": true,
+        "resizable": false,
+        "shadow": false,
+        "focus": false
+      },
+      {
         "label": "settings",
         "title": "归巢 · 控制台",
         "width": 660,

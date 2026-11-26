@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-radar-refresh"
+description = "Enables the radar_refresh command without any pre-configured scope."
+commands.allow = ["radar_refresh"]
+
+[[permission]]
+identifier = "deny-radar-refresh"
+description = "Denies the radar_refresh command without any pre-configured scope."
+commands.deny = ["radar_refresh"]

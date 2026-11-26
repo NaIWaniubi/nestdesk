@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-radar-clear"
+description = "Enables the radar_clear command without any pre-configured scope."
+commands.allow = ["radar_clear"]
+
+[[permission]]
+identifier = "deny-radar-clear"
+description = "Denies the radar_clear command without any pre-configured scope."
+commands.deny = ["radar_clear"]

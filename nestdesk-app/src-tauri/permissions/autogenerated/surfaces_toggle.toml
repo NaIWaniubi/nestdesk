@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-surfaces-toggle"
+description = "Enables the surfaces_toggle command without any pre-configured scope."
+commands.allow = ["surfaces_toggle"]
+
+[[permission]]
+identifier = "deny-surfaces-toggle"
+description = "Denies the surfaces_toggle command without any pre-configured scope."
+commands.deny = ["surfaces_toggle"]

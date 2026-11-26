@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-surfaces-state"
+description = "Enables the surfaces_state command without any pre-configured scope."
+commands.allow = ["surfaces_state"]
+
+[[permission]]
+identifier = "deny-surfaces-state"
+description = "Denies the surfaces_state command without any pre-configured scope."
+commands.deny = ["surfaces_state"]

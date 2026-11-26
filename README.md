@@ -1,6 +1,34 @@
 # 归巢 NestDesk
 
-Windows 桌面分区收纳 + 改装小组件 + **一键复原**（自用 MVP v0.5）
+Windows 桌面分区收纳 + 改装小组件 + **一键复原**（自用 MVP v0.6）
+
+## v0.6 新增：桌面监听 + 托盘快捷键 + 资讯雷达
+
+### 桌面自动归档（opt-in，默认关）
+控制台「更多」→ 勾选「开启监听」。**只搬开启之后新出现的文件**：
+开启那一刻桌面上的所有文件被记为基线，永不自动搬走；新文件需连续两轮（约 10s）指纹一致才搬；
+`.crdownload/.part/.tmp` 等下载中临时文件与隐藏文件一律跳过。同样过 journal，可一键复原。
+实测：357 个基线文件零移动，新建文件 10s 内自动进格，undo 后字节级归位。
+
+> 事故与修复记录见 `PLAN-v0.6.md` §4：初版把首轮快照当基线，曾在开启后把 354 个历史文件全部搬走，
+> 已用 journal 复原 354/354（missing=0），并新增 `--undo-all-offline` 纯命令行救援入口防复发。
+
+### 托盘 + 全局快捷键
+托盘菜单：⚡ 收取桌面 / ↩ 复原上批 / ⏸ 暂停面板 / ⚙ 打开控制台 / ✕ 退出。
+全局快捷键：`Ctrl+Alt+N` 收取桌面 · `Ctrl+Alt+H` 显隐全部面板 · `Ctrl+Alt+Z` 复原上批。
+「暂停面板」会隐藏 6 个桌面面板并停止钉扎（全屏游戏/演示场景），恢复后位置与透明度不变。
+
+### 资讯雷达（自接 API 定时收资讯）
+控制台「雷达」tab：
+- **源**：任意 RSS/Atom URL，或任意 JSON API（自动识别数组位置与 `title|name|headline`、
+  `link|url|html_url`、`summary|description` 字段名）；内置 HN 头条 / GitHub 趋势 / 阮一峰周刊 / 少数派
+- **关键词过滤**：任一命中即收（空 = 全收）
+- **定时抓取**：10–1440 分钟可调，后台线程执行；结果落 `radar.json`（+.bak 自愈），保留最近 200 条，按 link 去重
+- **消费**：每条可「→ 待办」一条条转成 todo；桌面「📡 资讯雷达」卡片显示最新 6 条（只读权限）
+
+实测：真实抓取 Hacker News 10 条；重复抓取 +0（去重生效）；关键词 `rust/ai` 过滤后无关项 0。
+
+## 归档与复原（v0.5 起）
 
 文件拖进收纳框 → 自动按类型归档到 `~/Nest/收件箱/<类别>/`，每一次移动都记进事务日志；
 任何时候点「复原上批 / 全部复原 / 勾选批次复原」，文件按原路放回原位（字节级，可验）。
@@ -22,7 +50,7 @@ Windows 桌面分区收纳 + 改装小组件 + **一键复原**（自用 MVP v0.
 - **最小权限**：`build.rs` 声明 AppManifest，6 窗口拆 6 份 capability——收纳框不能调 `music_open`/`dup_archive`/`settings_save`。实测 22 项授权矩阵全通过。
 - **体验**：透明度滑块即时预览 + 独立保存；事务批次可展开文件清单；桌面勾选列表超 120 项可「显示全部」；
   `user-select:text` 恢复文本可复制；`focus-visible` 键盘可达；night/mist 对比度提到 WCAG AA；CSP 收敛到 `script-src 'self'`。
-- **selftest 20/20**（原 16 + URL undo / YAML 往返 / YAML 拒绝穿越 / 批次真实组名），自清临时目录，panic 也输出 JSON。
+- **selftest 20/20**（v0.5 时；v0.6 扩到 26/26），自清临时目录，panic 也输出 JSON。
 
 ## 音乐（S-E：Folia 进程托管，非抄码）
 控制台「更多」标签 → 填 Folia 路径（github.com/chthollyphile/folia-major）或其他播放器 exe → 「▶ 打开音乐」。
@@ -64,10 +92,19 @@ npm run tauri build    # 发布 exe
 ```bash
 cargo run --bin nestdesk-app --manifest-path src-tauri/Cargo.toml -- --selftest
 ```
-覆盖 20 项断言：批量归档、7 类扩展名分类（含大写/未知/中文文件名）、跨批同名冲突 (2) 后缀、
+覆盖 **26 项**断言：批量归档、7 类扩展名分类（含大写/未知/中文文件名）、跨批同名冲突 (2) 后缀、
 已删文件的 missing 报告、全部复原字节级一致、幂等重复复原、undo_last 批次粒度、
-智能推荐、勾选批次复原、查重归档可复原、**URL 下载 undo 撤销下载**、**YAML 导出→导入往返**、
-**YAML 拒绝路径穿越组名**、**批次分组显示真实组名**。
+智能推荐、勾选批次复原、查重归档可复原、URL 下载 undo 撤销下载、YAML 导出→导入往返、
+YAML 拒绝路径穿越组名、批次分组显示真实组名、
+**监听基线文件不被搬走 / 新文件两轮后收 / 临时文件跳过**、**监听无新文件不产生空批次**、
+**雷达 RSS 解析+关键词过滤 / Atom href / 通用 JSON 字段识别 / 存储 .bak 自愈**。
+
+## 救援入口（事故急救，不启 GUI）
+```bash
+cargo run --bin nestdesk-app --manifest-path src-tauri/Cargo.toml -- --undo-all-offline
+```
+只读 journal 并全部复原，输出 JSON 证据（restored/missing/desktop_after/inbox_after）。
+用于批量误搬后 GUI 不方便启动的场景；实测 354/354 复原、missing=0。
 
 ## 真实桌面全链路演示（需显式确认，会移动真实桌面文件）
 ```bash

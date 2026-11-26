@@ -299,7 +299,7 @@ interface SuggestPlanT {
 }
 
 function Settings() {
-  type Tab = "桌面" | "归纳" | "事务" | "查重" | "更多";
+  type Tab = "桌面" | "归纳" | "事务" | "查重" | "雷达" | "更多";
   const [tab, setTab] = useState<Tab>("桌面");
   const [groups, setGroups] = useState<GroupRule[]>([]);
   const [alpha, setAlpha] = useState<Record<string, number>>({});
@@ -409,9 +409,73 @@ function Settings() {
     setSaved(await invoke<string>("music_set", { path: player.trim() }));
   };
 
+  // ---- v0.6 桌面监听 ----
+  const [watch, setWatch] = useState(false);
+  const [watchStat, setWatchStat] = useState<{ enabled: boolean; last_tick: number; last_moved: number }>({ enabled: false, last_tick: 0, last_moved: 0 });
+  useEffect(() => {
+    invoke<boolean>("watcher_get").then(setWatch).catch(() => {});
+    const t = window.setInterval(() => { invoke<typeof watchStat>("watcher_status").then(setWatchStat).catch(() => {}); }, 3000);
+    return () => window.clearInterval(t);
+  }, []);
+  const toggleWatch = async () => {
+    const on = await invoke<boolean>("watcher_set", { on: !watch });
+    setWatch(on);
+    setSaved(on ? "已开启桌面自动归档（新文件落盘后自动进格）" : "已关闭桌面自动归档");
+  };
+
+  // ---- v0.6 资讯雷达 ----
+  interface RadarItemT { title: string; link: string; summary: string; source: string; ts: number }
+  interface RadarStoreT { items: RadarItemT[]; last_fetch: number; last_error: string; fetch_count: number }
+  const [rCfg, setRCfg] = useState<{ enabled: boolean; interval_min: number; feeds: string[]; keywords: string[] }>({ enabled: false, interval_min: 60, feeds: [], keywords: [] });
+  const [rStore, setRStore] = useState<RadarStoreT>({ items: [], last_fetch: 0, last_error: "", fetch_count: 0 });
+  const [rFeedInput, setRFeedInput] = useState("");
+  const [rKwInput, setRKwInput] = useState("");
+  const [busy, setBusy] = useState(false);
+  const loadRadar = () => {
+    invoke<typeof rCfg>("radar_cfg").then((c) => { setRCfg(c); setRKwInput(c.keywords.join(", ")); }).catch(() => {});
+    invoke<RadarStoreT>("radar_items").then(setRStore).catch(() => {});
+  };
+  useEffect(() => { loadRadar(); }, []);
+  const saveRadar = async (patch: Partial<typeof rCfg>) => {
+    const next = { ...rCfg, ...patch, keywords: rKwInput.split(/[,，\s]+/).map((k) => k.trim()).filter(Boolean) };
+    const saved2 = await invoke<typeof rCfg>("radar_set", { cfg: next });
+    setRCfg(saved2); setRKwInput(saved2.keywords.join(", "));
+    setSaved(`雷达配置已保存：${saved2.feeds.length} 源 · ${saved2.keywords.length} 关键词 · ${saved2.enabled ? "定时开" : "定时关"}`);
+  };
+  const addFeed = async (url: string) => {
+    const u = url.trim(); if (!u) return;
+    if (rCfg.feeds.includes(u)) { setMsg("该源已存在"); return; }
+    const next = [...rCfg.feeds, u];
+    const saved2 = await invoke<typeof rCfg>("radar_set", { cfg: { ...rCfg, feeds: next, keywords: rKwInput.split(/[,，\s]+/).filter(Boolean) } });
+    setRCfg(saved2); setRFeedInput("");
+  };
+  const delFeed = async (url: string) => {
+    const saved2 = await invoke<typeof rCfg>("radar_set", { cfg: { ...rCfg, feeds: rCfg.feeds.filter((f) => f !== url), keywords: rKwInput.split(/[,，\s]+/).filter(Boolean) } });
+    setRCfg(saved2);
+  };
+  const addBuiltin = async () => {
+    const list = await invoke<[string, string][]>("radar_builtin");
+    const next = [...rCfg.feeds];
+    for (const [, u] of list) if (!next.includes(u)) next.push(u);
+    const saved2 = await invoke<typeof rCfg>("radar_set", { cfg: { ...rCfg, feeds: next, keywords: rKwInput.split(/[,，\s]+/).filter(Boolean) } });
+    setRCfg(saved2); setSaved(`已添加 ${list.length} 个内置源`);
+  };
+  const refreshRadar = async () => {
+    setBusy(true);
+    try {
+      const n = await invoke<number>("radar_refresh");
+      setSaved(`抓取完成：新增 ${n} 条`);
+    } catch (e) { setMsg(`抓取失败：${String(e).slice(0, 160)}`); }
+    finally { setBusy(false); loadRadar(); }
+  };
+  const toTodo = async (it: RadarItemT) => {
+    await invoke("radar_to_todo", { title: it.title, link: it.link });
+    setSaved("已加入待办");
+  };
+
   const tabs: { k: Tab; label: string }[] = [
     { k: "桌面", label: "桌面" }, { k: "归纳", label: "归纳" }, { k: "事务", label: "事务" },
-    { k: "查重", label: "查重" }, { k: "更多", label: "更多" },
+    { k: "查重", label: "查重" }, { k: "雷达", label: "雷达" }, { k: "更多", label: "更多" },
   ];
   const updateExts = (i: number, raw: string) => setGroups((gs) => gs.map((g, j) => (j === i ? { ...g, exts: raw.split(/[,，\s]+/).map((e) => e.trim().toLowerCase()).filter(Boolean) } : g)));
 
@@ -523,6 +587,65 @@ function Settings() {
           </>
         )}
 
+        {tab === "雷达" && (
+          <>
+            <div style={{ fontSize: 12, color: "var(--dim)", marginBottom: 8 }}>资讯雷达：自接 RSS/Atom 或 JSON API，按关键词定时抓取。</div>
+
+            <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8, flexWrap: "wrap" }}>
+              <label style={{ fontSize: 11 }}><input type="checkbox" checked={rCfg.enabled} onChange={(e) => saveRadar({ enabled: e.target.checked })} /> 定时抓取</label>
+              <span style={{ fontSize: 11, color: "var(--dim)" }}>每</span>
+              <input type="number" min={10} max={1440} value={rCfg.interval_min}
+                onChange={(e) => setRCfg((c) => ({ ...c, interval_min: Number(e.target.value) }))}
+                onBlur={() => saveRadar({ interval_min: rCfg.interval_min })}
+                style={{ width: 64, background: "var(--bar-bg)", border: "1px solid var(--border)", color: "var(--text)", borderRadius: 6, padding: "3px 6px", fontSize: 11 }} />
+              <span style={{ fontSize: 11, color: "var(--dim)" }}>分钟</span>
+              <span className="sp" style={{ flex: 1 }} />
+              <span className="btn nodrag" onClick={refreshRadar} style={busy ? { opacity: 0.5 } : {}}>{busy ? "抓取中…" : "⟳ 立即抓取"}</span>
+            </div>
+
+            <div style={{ fontSize: 11, color: "var(--dim)", margin: "10px 0 4px" }}>关键词（逗号分隔；空 = 全收）</div>
+            <input value={rKwInput} onChange={(e) => setRKwInput(e.target.value)} onBlur={() => saveRadar({})}
+              placeholder="Rust, AI, 开源, 实习"
+              style={{ width: "100%", boxSizing: "border-box", background: "var(--bar-bg)", border: "1px solid var(--border)", color: "var(--text)", borderRadius: 8, padding: "6px 9px", fontSize: 12, marginBottom: 10 }} />
+
+            <div style={{ fontSize: 11, color: "var(--dim)", margin: "4px 0" }}>资讯源（{rCfg.feeds.length}）</div>
+            <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+              <input value={rFeedInput} onChange={(e) => setRFeedInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") addFeed(rFeedInput); }}
+                placeholder="https://example.com/feed.xml 或 JSON API"
+                style={{ flex: 1, background: "var(--bar-bg)", border: "1px solid var(--border)", color: "var(--text)", borderRadius: 8, padding: "6px 9px", fontSize: 11 }} />
+              <span className="btn nodrag" onClick={() => addFeed(rFeedInput)}>＋ 加源</span>
+              <span className="btn nodrag" onClick={addBuiltin}>内置源</span>
+            </div>
+            {rCfg.feeds.map((f) => (
+              <div key={f} style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 10, padding: "2px 0" }}>
+                <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--dim)" }} title={f}>{f}</span>
+                <span className="btn nodrag" onClick={() => delFeed(f)}>✕</span>
+              </div>
+            ))}
+
+            <div style={{ display: "flex", gap: 8, alignItems: "center", margin: "12px 0 6px" }}>
+              <span style={{ fontSize: 12, color: "var(--dim)" }}>已收 {rStore.items.length} 条{rStore.last_fetch ? ` · 上次 ${new Date(rStore.last_fetch).toLocaleString()}` : ""}</span>
+              <span className="sp" style={{ flex: 1 }} />
+              {rStore.items.length > 0 && <span className="btn nodrag" onClick={async () => { setRStore(await invoke("radar_clear")); setSaved("已清空雷达列表"); }}>清空</span>}
+            </div>
+            {rStore.last_error && <div style={{ fontSize: 10, color: "#ff9d5c", marginBottom: 6, wordBreak: "break-all" }}>部分源失败：{rStore.last_error.slice(0, 200)}</div>}
+            {rStore.items.slice(0, 80).map((it, i) => (
+              <div key={`${it.link}-${i}`} style={{ borderBottom: "1px solid var(--border)", padding: "6px 0" }}>
+                <div style={{ fontSize: 12, lineHeight: 1.4 }}>
+                  {it.link ? <a href={it.link} target="_blank" rel="noreferrer" style={{ color: "var(--accent)", textDecoration: "none" }}>{it.title}</a> : it.title}
+                </div>
+                {it.summary && <div style={{ fontSize: 10, color: "var(--dim)", marginTop: 2 }}>{it.summary}</div>}
+                <div style={{ display: "flex", gap: 8, marginTop: 3, fontSize: 10, color: "var(--dim)" }}>
+                  <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{it.source}</span>
+                  <span className="btn nodrag" style={{ fontSize: 9, padding: "1px 6px" }} onClick={() => toTodo(it)}>→ 待办</span>
+                </div>
+              </div>
+            ))}
+            {rStore.items.length === 0 && <div style={{ fontSize: 11, color: "var(--dim)" }}>还没有资讯。加源后点「⟳ 立即抓取」。</div>}
+          </>
+        )}
+
         {tab === "更多" && (
           <>
             <div style={{ fontSize: 12, color: "var(--dim)", margin: "4px 0 8px" }}>面板透明度（实时生效）</div>
@@ -539,6 +662,19 @@ function Settings() {
               </div>
             ))}
             <div style={{ marginTop: 4 }}><span className="btn nodrag" onClick={save}>💾 保存透明度</span></div>
+
+            <div style={{ fontSize: 12, color: "var(--dim)", margin: "14px 0 6px" }}>桌面自动归档（新文件落盘后自动进格）</div>
+            <label style={{ fontSize: 11, display: "flex", gap: 6, alignItems: "center" }}>
+              <input type="checkbox" checked={watch} onChange={toggleWatch} />
+              开启监听（默认关，opt-in）
+            </label>
+            <div style={{ fontSize: 10, color: "var(--dim)", marginTop: 3 }}>
+              {watch
+                ? `运行中${watchStat.last_tick ? ` · 上次扫描 ${new Date(watchStat.last_tick).toLocaleTimeString()}${watchStat.last_moved ? ` · 上次归档 ${watchStat.last_moved} 个` : ""}` : " · 等待首次扫描"}`
+                : "关闭时不会动桌面任何文件"}
+              <br />两轮扫描指纹一致才搬，下载中的 .crdownload/.part 一律跳过；同样过 journal 可一键复原。
+            </div>
+
             <div style={{ fontSize: 12, color: "var(--dim)", margin: "12px 0 8px" }}>音乐（S-E：Folia/其他播放器托管）</div>
             <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 6 }}>
               <input className="nodrag" style={{ flex: 1, background: "var(--bar-bg)", border: "1px solid var(--border)", color: "var(--text)", borderRadius: 8, padding: "6px 9px", fontSize: 12 }}
@@ -620,6 +756,37 @@ function Todo() {
 }
 
 
+// ---------- 资讯雷达卡片（v0.6）----------
+interface RadarItemT2 { title: string; link: string; summary: string; source: string; ts: number }
+function Radar() {
+  const [items, setItems] = useState<RadarItemT2[]>([]);
+  const [, cycle] = useTheme();
+  const reload = () => invoke<{ items: RadarItemT2[] }>("radar_items").then((s) => setItems(s.items.slice(0, 6))).catch(() => {});
+  useEffect(() => {
+    reload();
+    const t = window.setInterval(reload, 60000);
+    return () => window.clearInterval(t);
+  }, []);
+  return (
+    <div className="card grab">
+      <div className="head"><b>📡 资讯雷达</b><span className="sp" />
+        <span className="badge nodrag" onClick={cycle} title="换肤">◐</span>
+      </div>
+      <div className="shelf-body nodrag">
+        {items.length === 0 && <div style={{ fontSize: 11, color: "var(--dim)", padding: 8 }}>暂无资讯<br />控制台「雷达」tab 加源</div>}
+        {items.map((it, i) => (
+          <div key={`${it.link}-${i}`} style={{ padding: "5px 0", borderBottom: "1px solid var(--border)" }}>
+            <div style={{ fontSize: 12, lineHeight: 1.35, overflow: "hidden", textOverflow: "ellipsis", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}
+              onDoubleClick={() => it.link && invoke("open_path", { path: it.link }).catch(() => {})}
+              title={it.link}>{it.title}</div>
+          </div>
+        ))}
+      </div>
+      <div className="foot"><span>最新 {items.length} 条</span><span className="sp" style={{ flex: 1 }} /><span>雷达</span></div>
+    </div>
+  );
+}
+
 export default function App() {
   const label = getCurrentWindow().label;
   if (label === "shelf") return <Shelf />;
@@ -628,5 +795,6 @@ export default function App() {
   if (label === "note") return <Note />;
   if (label === "settings") return <Settings />;
   if (label === "todo") return <Todo />;
+  if (label === "radar") return <Radar />;
   return <div className="card"><div className="head">未知面板 {label}</div></div>;
 }

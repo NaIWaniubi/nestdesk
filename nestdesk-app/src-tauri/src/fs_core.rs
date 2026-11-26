@@ -567,9 +567,95 @@ pub fn desk_items(cfg: &Config, groups: &[(String, Vec<String>)]) -> Vec<DeskIte
     out
 }
 
+// ================= v0.6 桌面监听（auto-filing） =================
+
+/// 桌面文件指纹：用来判断「文件已写完、可以搬」。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Finger { pub name: String, pub size: u64, pub mtime: u64 }
+
+/// 不稳定/临时文件：浏览器还在写、或系统垃圾，一律不碰。
+pub fn is_skip_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower.starts_with('.') || lower == "desktop.ini" || lower == "thumbs.db" { return true; }
+    const TAILS: [&str; 8] = [".tmp", ".temp", ".part", ".crdownload", ".partial", ".download", ".!qb", ".aria2"];
+    TAILS.iter().any(|t| lower.ends_with(t))
+}
+
+/// 扫描桌面，返回 (name → Finger)，只收普通文件。
+pub fn scan_desktop(desktop: &Path) -> HashMap<String, Finger> {
+    let mut out = HashMap::new();
+    let Ok(rd) = fs::read_dir(desktop) else { return out };
+    for e in rd.flatten() {
+        let p = e.path();
+        if !p.is_file() { continue; }
+        let name = e.file_name().to_string_lossy().to_string();
+        if is_skip_name(&name) { continue; }
+        let Ok(m) = e.metadata() else { continue };
+        let mtime = m.modified().ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        out.insert(name.clone(), Finger { name, size: m.len(), mtime });
+    }
+    out
+}
+
+/// 一次监听 tick：把「上一轮就存在且两轮指纹一致」的文件交给 ingest。
+/// `prev` 由调用方保存（上一轮快照），返回本轮快照与本次收取结果。
+/// 监听状态：`baseline` 是开启监听那一刻桌面上的文件（**永不自动搬走**），
+/// `pending` 是之后新出现、还在等待「第二轮指纹一致」的文件。
+#[derive(Clone, Debug, Default)]
+pub struct WatchState {
+    pub baseline: HashMap<String, Finger>,
+    pub pending: HashMap<String, Finger>,
+}
+
+impl WatchState {
+    /// 播种：把当前桌面全部记为基线（开启监听/重新开启时调用）。
+    pub fn seed(desktop: &Path) -> Self {
+        Self { baseline: scan_desktop(desktop), pending: HashMap::new() }
+    }
+}
+
+/// 一次监听 tick。返回新状态 + 本次收取结果（无可收时为 None）。
+/// 关键不变量：**基线文件永不因为「存在且稳定」而被搬走**——只有播种后新出现的文件才会被收。
+pub fn watch_once(cfg: &Config, state: &WatchState) -> (WatchState, Option<IngestResult>) {
+    let cur = scan_desktop(&cfg.desktop);
+    let mut next = WatchState { baseline: state.baseline.clone(), pending: HashMap::new() };
+    let mut ready: Vec<String> = Vec::new();
+    for (name, f) in &cur {
+        if is_skip_name(name) {
+            continue;
+        }
+        if next.baseline.contains_key(name) {
+            continue; // 开启监听前就有的文件：一律不动
+        }
+        match state.pending.get(name) {
+            // 上一轮刚见过且指纹未变 → 认为落盘完成
+            Some(old) if old.size == f.size && old.mtime == f.mtime => {
+                ready.push(cfg.desktop.join(name).to_string_lossy().to_string());
+            }
+            // 首次出现，或还在变化（大小/mtime 变了）→ 继续等
+            _ => { next.pending.insert(name.clone(), f.clone()); }
+        }
+    }
+    if ready.is_empty() {
+        return (next, None);
+    }
+    ready.sort();
+    let res = ingest(cfg, ready);
+    // 已搬走的从基线/待定里清掉，避免状态无界增长
+    for m in &res.moved {
+        if let Some(n) = std::path::Path::new(&m.old).file_name().and_then(|x| x.to_str()) {
+            next.baseline.remove(n);
+            next.pending.remove(n);
+        }
+    }
+    (next, Some(res))
+}
+
 #[derive(Serialize, Clone, Debug)]
-pub struct ExtStat { pub ext: String, pub count: usize }
-#[derive(Serialize, Clone, Debug)]
+pub struct ExtStat { pub ext: String, pub count: usize }#[derive(Serialize, Clone, Debug)]
 pub struct GroupRule2 { pub name: String, pub exts: Vec<String> }
 #[derive(Serialize, Clone, Debug)]
 pub struct SuggestPlan {

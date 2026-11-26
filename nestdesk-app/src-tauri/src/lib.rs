@@ -1,6 +1,7 @@
 // lib.rs — NestDesk v0：桌面层 surface 引擎 + 收纳归档 + journal 复原 + 小组件 + 控制台设置
 mod fs_core;
 mod layer;
+mod radar;
 
 use fs_core::{Config, DeskItem, DupSet, IngestResult, Snapshot, SuggestPlan, UndoReport};
 use std::process::Command;
@@ -12,7 +13,7 @@ use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 use tauri::{Manager, PhysicalPosition, PhysicalSize, Position, Size};
 
-pub const SURFACES: [&str; 5] = ["shelf", "clock", "sysmon", "note", "todo"];
+pub const SURFACES: [&str; 6] = ["shelf", "clock", "sysmon", "note", "todo", "radar"];
 
 // ---------- 应用级路径 ----------
 fn appdata() -> PathBuf {
@@ -47,11 +48,38 @@ fn desktop_dir() -> PathBuf {
 #[derive(Serialize, Deserialize, Clone)]
 struct GroupRule { name: String, exts: Vec<String> }
 
+/// 资讯雷达配置（自接 API，定时抓取）
+#[derive(Serialize, Deserialize, Clone)]
+struct RadarCfg {
+    /// 是否启用后台定时抓取
+    #[serde(default)]
+    enabled: bool,
+    /// 抓取间隔（分钟，10..=1440）
+    #[serde(default = "radar_default_interval")]
+    interval_min: u32,
+    /// RSS/Atom 或 JSON API URL 列表
+    #[serde(default)]
+    feeds: Vec<String>,
+    /// 关键词过滤（任一命中即收；空 = 全收）
+    #[serde(default)]
+    keywords: Vec<String>,
+}
+fn radar_default_interval() -> u32 { 60 }
+impl Default for RadarCfg {
+    fn default() -> Self { Self { enabled: false, interval_min: 60, feeds: vec![], keywords: vec![] } }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct AppSettings {
     groups: Vec<GroupRule>,
     /// 每个面板的窗口级不透明度（30..=255，LWA_ALPHA）
     alpha: HashMap<String, u32>,
+    /// 桌面监听自动归档（默认关，opt-in）
+    #[serde(default)]
+    auto_watch: bool,
+    /// 资讯雷达
+    #[serde(default)]
+    radar: RadarCfg,
 }
 
 fn settings_path() -> PathBuf { data_dir().join("settings.json") }
@@ -60,12 +88,19 @@ fn settings_defaults() -> AppSettings {
     let groups: Vec<GroupRule> = fs_core::default_groups().iter()
         .map(|(n, e)| GroupRule { name: n.clone(), exts: e.clone() })
         .collect();
-    let alpha = [("shelf", 254u32), ("clock", 250), ("sysmon", 250), ("note", 250)]
+    let alpha = [("shelf", 254u32), ("clock", 250), ("sysmon", 250), ("note", 250), ("todo", 250)]
         .iter().map(|(k, v)| (k.to_string(), *v)).collect();
-    AppSettings { groups, alpha }
+    AppSettings { groups, alpha, auto_watch: false, radar: RadarCfg::default() }
 }
 
 static SETTINGS: OnceLock<RwLock<AppSettings>> = OnceLock::new();
+
+// 桌面监听线程状态（v0.6）
+static WATCH_RESEED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static WATCH_LAST_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WATCH_LAST_MOVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// 雷达上次抓取时间（后台线程节流用）
+static RADAR_LAST_FETCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn init_settings() {
     if SETTINGS.get().is_some() {
@@ -382,13 +417,105 @@ fn settings_save(groups: Vec<GroupRule>, alpha: HashMap<String, u32>) -> AppSett
     s
 }
 
-// ---------- v0.4 fusion commands ----------
+// ---------- v0.6 桌面监听 ----------
+#[tauri::command]
+fn watcher_get() -> bool {
+    current_settings().auto_watch
+}
+
+/// 开关桌面监听；返回最终状态。开启会立即做一次基线快照（不搬历史文件）。
+#[tauri::command]
+fn watcher_set(on: bool) -> bool {
+    init_settings();
+    let mut s = current_settings();
+    s.auto_watch = on;
+    if let Some(r) = SETTINGS.get() { *r.write().unwrap_or_else(|e| e.into_inner()) = s.clone(); }
+    save_settings_file();
+    WATCH_RESEED.store(true, std::sync::atomic::Ordering::Relaxed);
+    on
+}
+
+#[tauri::command]
+fn watcher_status() -> serde_json::Value {
+    let s = current_settings();
+    serde_json::json!({
+        "enabled": s.auto_watch,
+        "last_tick": WATCH_LAST_TICK.load(std::sync::atomic::Ordering::Relaxed),
+        "last_moved": WATCH_LAST_MOVED.load(std::sync::atomic::Ordering::Relaxed),
+    })
+}
+
+/// v0.4 fusion commands ----------
 #[tauri::command]
 fn shelf_save_url(url: String) -> IngestResult {
     init_settings();
     let s = current_settings();
     let groups: Vec<(String, Vec<String>)> = s.groups.iter().map(|g| (g.name.clone(), g.exts.clone())).collect();
     fs_core::save_url(&real_cfg(), &groups, &url)
+}
+
+// ---------- v0.6 资讯雷达 ----------
+#[tauri::command]
+fn radar_cfg() -> RadarCfg {
+    current_settings().radar
+}
+
+/// 保存雷达配置（feeds/keywords/interval/enabled），顺带清洗 URL 与关键词。
+#[tauri::command]
+fn radar_set(cfg: RadarCfg) -> RadarCfg {
+    init_settings();
+    let mut s = current_settings();
+    let mut clean = cfg;
+    clean.interval_min = clean.interval_min.clamp(10, 1440);
+    clean.feeds = clean.feeds.into_iter()
+        .map(|u| u.trim().to_string())
+        .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
+        .take(20)
+        .collect();
+    clean.keywords = clean.keywords.into_iter()
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty() && k.chars().count() <= 40)
+        .take(50)
+        .collect();
+    s.radar = clean.clone();
+    if let Some(r) = SETTINGS.get() { *r.write().unwrap_or_else(|e| e.into_inner()) = s; }
+    save_settings_file();
+    clean
+}
+
+#[tauri::command]
+fn radar_items() -> radar::RadarStore {
+    radar::load_store(&radar::store_path(&data_dir()))
+}
+
+#[tauri::command]
+fn radar_refresh() -> Result<usize, String> {
+    init_settings();
+    let s = current_settings();
+    // 手动刷新不受 enabled 限制（用户点了就是要抓）
+    let n = radar::fetch_once(&radar::store_path(&data_dir()), &s.radar.feeds, &s.radar.keywords)?;
+    RADAR_LAST_FETCH.store(fs_core::now_ms(), std::sync::atomic::Ordering::Relaxed);
+    Ok(n)
+}
+
+#[tauri::command]
+fn radar_builtin() -> Vec<(String, String)> {
+    radar::builtin_feeds().into_iter().map(|(n, u)| (n.to_string(), u.to_string())).collect()
+}
+
+#[tauri::command]
+fn radar_clear() -> radar::RadarStore {
+    let p = radar::store_path(&data_dir());
+    let store = radar::RadarStore::default();
+    radar::save_store(&p, &store);
+    store
+}
+
+/// 把一条资讯转成待办（复用 todo 存储）
+#[tauri::command]
+fn radar_to_todo(title: String, link: String) {
+    let text = if link.is_empty() { title } else { format!("{title} — {link}") };
+    let _ = todo_add(text);
 }
 
 // ---- Glance: 农历（.NET ChineseLunisolarCalendar，零数据风险）----
@@ -538,10 +665,113 @@ fn clamp_geom(app: &tauri::AppHandle, g: Geom) -> Geom {
     }
 }
 
+/// 面板暂停状态：全屏游戏/演示时隐藏 5 个 surface 并停钉扎（SPEC C12）
+static SURFACES_PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn surfaces_hidden() -> bool {
+    SURFACES_PAUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 显示/隐藏全部桌面面板；返回隐藏后的状态（true = 已隐藏/暂停）。
+fn set_surfaces_hidden(app: &tauri::AppHandle, hide: bool) -> bool {
+    for label in SURFACES {
+        if let Some(w) = app.get_webview_window(label) {
+            if hide {
+                let _ = w.hide();
+            } else {
+                let _ = w.show();
+            }
+        }
+    }
+    SURFACES_PAUSED.store(hide, std::sync::atomic::Ordering::Relaxed);
+    hide
+}
+
+fn toggle_surfaces(app: &tauri::AppHandle) -> bool {
+    let next = !surfaces_hidden();
+    set_surfaces_hidden(app, next)
+}
+
+#[tauri::command]
+fn surfaces_toggle(app: tauri::AppHandle) -> bool {
+    toggle_surfaces(&app)
+}
+
+#[tauri::command]
+fn surfaces_state() -> bool {
+    surfaces_hidden()
+}
+
+/// 托盘图标 + 菜单（收取桌面 / 复原上批 / 暂停面板 / 控制台 / 退出）
+fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::TrayIconBuilder;
+
+    let collect = MenuItem::with_id(app, "collect", "⚡ 收取桌面", true, None::<&str>)?;
+    let undo = MenuItem::with_id(app, "undo", "↩ 复原上批", true, None::<&str>)?;
+    let pause = MenuItem::with_id(app, "pause", "⏸ 暂停/恢复面板", true, None::<&str>)?;
+    let console = MenuItem::with_id(app, "console", "⚙ 打开控制台", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "✕ 退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&collect, &undo, &pause, &console, &quit])?;
+
+    let mut builder = TrayIconBuilder::with_id("nestdesk")
+        .menu(&menu)
+        .tooltip("归巢 NestDesk")
+        .on_menu_event(|app, ev| match ev.id().as_ref() {
+            "collect" => { let _ = fs_core::collect_desktop(&real_cfg()); }
+            "undo" => { let _ = fs_core::undo_last(&real_cfg()); }
+            "pause" => { toggle_surfaces(app); }
+            "console" => {
+                if let Some(w) = app.get_webview_window("settings") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+            }
+            "quit" => app.exit(0),
+            _ => {}
+        });
+    if let Some(icon) = app.default_window_icon().cloned() {
+        builder = builder.icon(icon);
+    }
+    builder.build(app)?;
+    Ok(())
+}
+
+/// 全局快捷键：Ctrl+Alt+N 收取桌面 / Ctrl+Alt+H 显隐面板 / Ctrl+Alt+Z 复原上批
+fn register_hotkeys(app: &tauri::AppHandle) {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+    let gs = app.global_shortcut();
+    for (combo, name) in [("Ctrl+Alt+N", "collect"), ("Ctrl+Alt+H", "toggle"), ("Ctrl+Alt+Z", "undo")] {
+        if let Err(e) = gs.register(combo) {
+            // 组合被其它程序占用时不让启动失败，只记录
+            eprintln!("[hotkey] {combo} ({name}) 注册失败: {e}");
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     init_settings();
     let app = tauri::Builder::default()
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, shortcut, event| {
+                    if event.state() != tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                        return;
+                    }
+                    let key = shortcut.to_string();
+                    if key.contains('N') {
+                        let r = fs_core::collect_desktop(&real_cfg());
+                        eprintln!("[hotkey] collect: moved={} failed={}", r.moved.len(), r.failed.len());
+                    } else if key.contains('H') {
+                        toggle_surfaces(app);
+                    } else if key.contains('Z') {
+                        let r = fs_core::undo_last(&real_cfg());
+                        eprintln!("[hotkey] undo_last: restored={} missing={}", r.restored, r.missing.len());
+                    }
+                })
+                .build(),
+        )
         .invoke_handler(tauri::generate_handler![
             shelf_snapshot, shelf_ingest, shelf_collect_desktop, shelf_undo_last, shelf_undo_all,
             get_sysinfo, note_get, note_set, theme_get, theme_set,
@@ -549,8 +779,15 @@ pub fn run() {
             shelf_desk_items, plan_suggest, yaml_export, yaml_import,
             shelf_batches, shelf_undo_selected, dup_scan, dup_archive,
             shelf_save_url, todo_list, todo_add, todo_toggle, todo_del, music_open,
-            lunar_now, music_set, open_path, reveal_path, alpha_live
+            lunar_now, music_set, open_path, reveal_path, alpha_live,
+            watcher_get, watcher_set, watcher_status, surfaces_toggle, surfaces_state,
+            radar_cfg, radar_set, radar_items, radar_refresh, radar_builtin, radar_clear, radar_to_todo
         ])
+        .setup(|app| {
+            build_tray(app.handle())?;
+            register_hotkeys(app.handle());
+            Ok(())
+        })
         .build(tauri::generate_context!())
         .expect("NestDesk 启动失败");
 
@@ -572,7 +809,7 @@ pub fn run() {
         loop {
             std::thread::sleep(Duration::from_millis(2000));
             let mut changed = false;
-            let pin = std::env::var_os("NESTDESK_NOPIN").is_none();
+            let pin = std::env::var_os("NESTDESK_NOPIN").is_none() && !surfaces_hidden();
             for w in layout_windows(&handle) {
                 let is_surface = SURFACES.contains(&w.label());
                 if let Ok(h) = w.hwnd() {
@@ -630,7 +867,87 @@ pub fn run() {
         }
     });
 
+    // 桌面监听线程（v0.6）：5s 轮询；基线文件永不自动搬走，只收「开启后新出现且两轮稳定」的
+    std::thread::spawn(move || {
+        use std::sync::atomic::Ordering;
+        let mut state = fs_core::WatchState::default();
+        let mut seeded = false;
+        loop {
+            std::thread::sleep(Duration::from_secs(5));
+            let enabled = current_settings().auto_watch;
+            if !enabled {
+                // 关闭期间持续刷新基线：重新打开时不会把历史文件一次性搬走
+                state = fs_core::WatchState::seed(&desktop_dir());
+                seeded = true;
+                WATCH_RESEED.store(false, Ordering::Relaxed);
+                continue;
+            }
+            if !seeded || WATCH_RESEED.swap(false, Ordering::Relaxed) {
+                // 刚开启：当前桌面全部记为基线，一条都不搬
+                state = fs_core::WatchState::seed(&desktop_dir());
+                seeded = true;
+                WATCH_LAST_TICK.store(fs_core::now_ms(), Ordering::Relaxed);
+                continue;
+            }
+            let cfg = real_cfg();
+            let (next, moved) = fs_core::watch_once(&cfg, &state);
+            state = next;
+            WATCH_LAST_TICK.store(fs_core::now_ms(), Ordering::Relaxed);
+            if let Some(r) = moved {
+                if !r.moved.is_empty() {
+                    WATCH_LAST_MOVED.store(r.moved.len() as u64, Ordering::Relaxed);
+                }
+            }
+        }
+    });
+
+    // 资讯雷达定时线程（v0.6）：按 interval_min 抓取，默认关闭
+    std::thread::spawn(move || {
+        use std::sync::atomic::Ordering;
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
+            let s = current_settings();
+            if !s.radar.enabled || s.radar.feeds.is_empty() {
+                continue;
+            }
+            let interval_ms = (s.radar.interval_min.max(10) as u64) * 60_000;
+            let last = RADAR_LAST_FETCH.load(Ordering::Relaxed);
+            let now = fs_core::now_ms();
+            if last != 0 && now.saturating_sub(last) < interval_ms {
+                continue;
+            }
+            let p = radar::store_path(&data_dir());
+            match radar::fetch_once(&p, &s.radar.feeds, &s.radar.keywords) {
+                Ok(n) => eprintln!("[radar] fetched {n} new items"),
+                Err(e) => eprintln!("[radar] fetch failed: {e}"),
+            }
+            RADAR_LAST_FETCH.store(now, Ordering::Relaxed);
+        }
+    });
+
     app.run(|_app, _event| {});
+}
+
+// ---------- 救援入口：不启 GUI，直接按 journal 全部复原（--undo-all-offline） ----------
+/// 场景：监听/批量操作误搬后 GUI 起不来。只读 journal + 复原，不吃网络、不碰设置。
+pub fn rescue_undo_all() {
+    init_settings();
+    let cfg = real_cfg();
+    let before = fs_core::snapshot(&cfg);
+    let rep = fs_core::undo_all(&cfg);
+    let after = fs_core::snapshot(&cfg);
+    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+        "phase": "rescue_undo_all",
+        "desktop_before": before.desktop_files,
+        "inbox_before": before.inbox_total,
+        "journal_before": before.journal_len,
+        "restored": rep.restored,
+        "renamed": rep.renamed,
+        "missing": rep.missing,
+        "desktop_after": after.desktop_files,
+        "inbox_after": after.inbox_total,
+        "journal_after": after.journal_len,
+    })).unwrap());
 }
 
 // ---------- --demo：真实桌面全链路（收取→分格→复原），JSON 证据输出后退出 ----------
@@ -891,6 +1208,62 @@ fn selftest_body() {
     let bb = fs_core::list_batches(&cfg2);
     let grp_ok = bb.iter().any(|b| b.groups.iter().any(|(g, _)| g == "图片"));
     report("事务: 批次分组显示真实组名", grp_ok, format!("{:?}", bb.first().map(|b| &b.groups)));
+
+    // v0.6 回归 1：桌面监听——基线文件永不搬走；新文件两轮稳定后才收；临时文件跳过
+    let wd = root.join("watchbox");
+    let wb = root.join("watchbox-inbox");
+    let _ = fs::create_dir_all(&wd);
+    let _ = fs::create_dir_all(&wb);
+    let wcfg = Config { desktop: wd.clone(), inbox_root: wb.clone(), journal: wd.join("journal.jsonl"), groups: None };
+    let w_old = wd.join("existing-before-watch.txt");
+    fs::write(&w_old, b"OLD").unwrap();
+    // 播种（此刻桌面已有 1 个文件 → 进基线）
+    let mut st = fs_core::WatchState::seed(&wd);
+    // 新文件 + 下载中临时文件
+    let w_new = wd.join("new-after-watch.pdf");
+    let w_part = wd.join("downloading.crdownload");
+    fs::write(&w_new, b"NEW-PDF").unwrap();
+    fs::write(&w_part, b"PARTIAL").unwrap();
+    // 第一轮：新文件刚出现 → 只记 pending，不搬
+    let (st2, r1) = fs_core::watch_once(&wcfg, &st);
+    // 第二轮：指纹一致 → 搬走新文件；基线文件与临时文件都不动
+    let (st3, r2) = fs_core::watch_once(&wcfg, &st2);
+    st.baseline.clear();
+    let moved_new = r2.as_ref().map(|r| r.moved.len()).unwrap_or(0);
+    report("监听: 基线文件不被搬走、新文件两轮后收、临时文件跳过",
+        r1.is_none() && moved_new == 1 && w_old.exists() && !w_new.exists() && w_part.exists(),
+        format!("first={:?} second_moved={moved_new} baseline_kept={} part_kept={}", r1.is_some(), w_old.exists(), w_part.exists()));
+    // 再跑一轮：桌面只剩基线 + 临时文件 → 无动作（幂等，不会重复搬）
+    let (_, r3) = fs_core::watch_once(&wcfg, &st3);
+    report("监听: 无新文件时不产生空批次", r3.is_none(), format!("third={:?}", r3.is_some()));
+    let _ = fs::remove_file(&w_part);
+
+    // v0.6 回归 2：雷达解析（RSS + Atom + JSON + 关键词过滤 + 去重语义）
+    let rss = r#"<rss><channel>
+      <item><title>Rust 1.90 发布</title><link>https://n/1</link><description>编译器改进</description></item>
+      <item><title>娱乐八卦</title><link>https://n/2</link><description>无关</description></item>
+    </channel></rss>"#;
+    let parsed = radar::parse_feed(rss);
+    let kw = vec!["rust".to_string()];
+    let hit = parsed.iter().filter(|i| radar::matches_keywords(i, &kw)).count();
+    report("雷达: RSS 解析 + 关键词过滤", parsed.len() == 2 && hit == 1, format!("parsed={} hit={}", parsed.len(), hit));
+    let atom = r#"<feed><entry><title>Atom 条目</title><link rel="alternate" href="https://a/9"/><summary>摘要</summary></entry></feed>"#;
+    let ai = radar::parse_feed(atom);
+    report("雷达: Atom 解析 href", ai.len() == 1 && ai[0].link == "https://a/9", format!("{:?}", ai.first().map(|i| &i.link)));
+    let js = r#"{"data":{"list":[{"title":"T1","url":"https://j/1"},{"title":"T2","html_url":"https://j/2"}]}}"#;
+    let ji = radar::parse_json_feed(js, "https://api");
+    report("雷达: 通用 JSON 自动识别字段", ji.len() == 2 && ji[0].link == "https://j/1", format!("{:?}", ji.iter().map(|i| &i.link).collect::<Vec<_>>()));
+
+    // v0.6 回归 3：雷达存储 .bak 自愈 + 去重上限
+    let rp = root.join("radar.json");
+    let mut st = radar::RadarStore::default();
+    st.items.push(radar::FeedItem { title: "A".into(), link: "https://x/1".into(), summary: String::new(), source: "s".into(), ts: 1 });
+    radar::save_store(&rp, &st);
+    let loaded = radar::load_store(&rp);
+    fs::write(&rp, b"not json at all").unwrap(); // 主文件损坏
+    let healed = radar::load_store(&rp);
+    report("雷达: 存储落盘 + 主文件损坏走 .bak 自愈",
+        loaded.items.len() == 1 && healed.items.len() == 1, format!("loaded={} healed={}", loaded.items.len(), healed.items.len()));
 
     let pass = checks.iter().all(|c| c["ok"].as_bool().unwrap_or(false));
     println!("{}", serde_json::to_string_pretty(&serde_json::json!({"pass": pass, "checks": checks, "root": root})).unwrap());

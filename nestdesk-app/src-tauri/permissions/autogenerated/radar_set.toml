@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-radar-set"
+description = "Enables the radar_set command without any pre-configured scope."
+commands.allow = ["radar_set"]
+
+[[permission]]
+identifier = "deny-radar-set"
+description = "Denies the radar_set command without any pre-configured scope."
+commands.deny = ["radar_set"]

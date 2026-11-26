@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-radar-cfg"
+description = "Enables the radar_cfg command without any pre-configured scope."
+commands.allow = ["radar_cfg"]
+
+[[permission]]
+identifier = "deny-radar-cfg"
+description = "Denies the radar_cfg command without any pre-configured scope."
+commands.deny = ["radar_cfg"]
